@@ -60,6 +60,9 @@ def main():
             "TELEGRAM_BOT_TOKEN is not configured"
         )
 
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
     bot = Bot(token=token)
     dp = Dispatcher(bot)
 
@@ -69,6 +72,7 @@ def main():
         dp,
         skip_updates=True,
         on_startup=on_startup,
+        loop=loop,
     )
 
 
