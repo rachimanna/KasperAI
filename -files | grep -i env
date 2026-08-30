@@ -1,0 +1,82 @@
+[33mcommit 164ca4baea586c283fd50491fe804334a712ffe3[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m)[m
+Author: rachimanna <aminadagestan951@gmail.com>
+Date:   Sun Aug 30 14:42:47 2026 +0200
+
+    Initial commit
+
+ .en                                 |   1 [32m+[m
+ .env.example                        |  13 [32m+[m
+ .gitignore                          |   4 [32m+[m
+ __pycache__/main.cpython-313.pyc    | Bin [31m0[m -> [32m1566[m bytes
+ bot.log                             |   3 [32m+[m
+ config/__init__.py                  |   0
+ .../__init__.cpython-313.pyc        | Bin [31m0[m -> [32m157[m bytes
+ .../settings.cpython-313.pyc        | Bin [31m0[m -> [32m1165[m bytes
+ config/settings.py                  |  21 [32m+[m
+ data/music_cache/Anna asti.mp3      | Bin [31m0[m -> [32m3209205[m bytes
+ ...276\321\207\320\272\320\270.mp3" | Bin [31m0[m -> [32m3329794[m bytes
+ ...276\321\207\320\272\320\270.mp3" | Bin [31m0[m -> [32m3327909[m bytes
+ ...220\321\201\321\202\320\270.mp3" | Bin [31m0[m -> [32m3209883[m bytes
+ ...260\321\201\321\202\320\270.mp3" | Bin [31m0[m -> [32m2685070[m bytes
+ ...275\320\270\320\272\320\260.mp3" | Bin [31m0[m -> [32m2835816[m bytes
+ database/__init__.py                |  13 [32m+[m
+ .../__init__.cpython-313.pyc        | Bin [31m0[m -> [32m301[m bytes
+ .../__pycache__/db.cpython-313.pyc  | Bin [31m0[m -> [32m16083[m bytes
+ database/db.py                      | 307 [32m++++++[m
+ database/db.py.bak_before_groupchat | 184 [32m++++[m
+ generated_sites/answer_13_131.txt   | 278 [32m++++++[m
+ generated_sites/answer_13_142.txt   | 356 [32m+++++++[m
+ generated_sites/answer_13_306.txt   | 166 [32m++++[m
+ kasper.zip                          | Bin [31m0[m -> [32m62186[m bytes
+ main.py                             |  56 [32m++[m
+ memory/__init__.py                  |  13 [32m+[m
+ .../__init__.cpython-313.pyc        | Bin [31m0[m -> [32m302[m bytes
+ .../memory.cpython-313.pyc          | Bin [31m0[m -> [32m3281[m bytes
+ .../service.cpython-313.pyc         | Bin [31m0[m -> [32m1040[m bytes
+ memory/memory.py                    |  51 [32m+[m
+ memory/service.py                   |  28 [32m+[m
+ mybot.zip                           | Bin [31m0[m -> [32m78693682[m bytes
+ mybot_clean.zip                     | Bin [31m0[m -> [32m97285128[m bytes
+ .../service.cpython-313.pyc         | Bin [31m0[m -> [32m1120[m bytes
+ projects/service.py                 |  32 [32m+[m
+ .../ai_router.cpython-313.pyc       | Bin [31m0[m -> [32m21277[m bytes
+ .../context.cpython-313.pyc         | Bin [31m0[m -> [32m1019[m bytes
+ .../music.cpython-313.pyc           | Bin [31m0[m -> [32m3615[m bytes
+ .../web_search.cpython-313.pyc      | Bin [31m0[m -> [32m3187[m bytes
+ router/ai_router.backup.py          | 266 [32m++++++[m
+ router/ai_router.py                 | 576 [32m++++++++++++[m
+ router/ai_router.py.bak             | 505 [32m++++++++++[m
+ router/context.py                   |  21 [32m+[m
+ router/music.py                     |  72 [32m++[m
+ router/web_search.py                |  65 [32m++[m
+ telegram/__init__.p                 |   0
+ .../__pycache__/bot.cpython-313.pyc | Bin [31m0[m -> [32m770[m bytes
+ .../handlers.cpython-313.pyc        | Bin [31m0[m -> [32m21352[m bytes
+ telegram/bot.py                     |  24 [32m+[m
+ telegram/handlers.py                | 407 [32m++++++++[m
+ ...handlers.py.bak_before_animation | 131 [32m+++[m
+ ...andlers.py.bak_before_groupchat2 | 186 [32m++++[m
+ .../handlers.py.bak_before_groups   | 170 [32m++++[m
+ .../handlers.py.bak_before_welcome  | 184 [32m++++[m
+ test_ai.py                          | 108 [32m+++[m
+ test_gemini.py                      |  37 [32m+[m
+ test_gemini_http.py                 |  29 [32m+[m
+ .../check_config.cpython-313.pyc    | Bin [31m0[m -> [32m1029[m bytes
+ .../debug_gemini.cpython-313.pyc    | Bin [31m0[m -> [32m1643[m bytes
+ .../test_context.cpython-313.pyc    | Bin [31m0[m -> [32m1439[m bytes
+ .../test_database.cpython-313.pyc   | Bin [31m0[m -> [32m1066[m bytes
+ .../test_gemini.cpython-313.pyc     | Bin [31m0[m -> [32m1116[m bytes
+ .../test_memory.cpython-313.pyc     | Bin [31m0[m -> [32m1738[m bytes
+ ...t_memory_service.cpython-313.pyc | Bin [31m0[m -> [32m1273[m bytes
+ .../test_projects.cpython-313.pyc   | Bin [31m0[m -> [32m1609[m bytes
+ .../test_router.cpython-313.pyc     | Bin [31m0[m -> [32m753[m bytes
+ tests/check_config.py               |  20 [32m+[m
+ tests/debug_gemini.py               |  53 [32m++[m
+ tests/test_context.py               |  46 [32m+[m
+ tests/test_database.py              |  32 [32m+[m
+ tests/test_gemini.py                |  21 [32m+[m
+ tests/test_memory.py                |  43 [32m+[m
+ tests/test_memory_service.py        |  35 [32m+[m
+ tests/test_projects.py              |  57 [32m++[m
+ tests/test_router.py                |  26 [32m+[m
+ 75 files changed, 4640 insertions(+)

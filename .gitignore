@@ -1,0 +1,12 @@
+.env
+.en
+*.bak
+*.bak_*
+*.backup.py
+__pycache__/
+*.pyc
+*.log
+*.zip
+data/music_cache/
+generated_sites/
+venv/
