@@ -14,7 +14,7 @@ CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "")
 
 AI_PROVIDERS = [
     p.strip().lower()
-    for p in os.getenv("AI_PROVIDERS", "gemini,groq,cerebras").split(",")
+    for p in os.getenv("AI_PROVIDERS", "gemini,groq,cerebras,openai").split(",")
     if p.strip()
 ]
 
