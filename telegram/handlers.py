@@ -149,7 +149,7 @@ async def handle_message(message: types.Message):
 
     history = await get_history(
         user_id,
-        limit=10,
+        limit=5,
         chat_id=chat_id,
     )
 
