@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher
@@ -8,6 +10,22 @@ from aiogram import executor
 
 from database.db import init_db
 from telegram.handlers import register_handlers
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
 
 
 async def on_startup(dp):
@@ -32,6 +50,8 @@ def main():
     )
 
     print("Kasper AI starting...")
+
+    threading.Thread(target=run_health_server, daemon=True).start()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
 
