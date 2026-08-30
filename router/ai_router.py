@@ -315,6 +315,12 @@ async def ask_provider(session, provider, messages):
             messages,
         )
 
+    elif provider == "xkiro":
+        answer = await ask_xkiro(
+            session,
+            messages,
+        )
+
     elif provider in ("groq", "cerebras", "openai"):
         answer = await ask_openai_compatible(
             session,
@@ -574,3 +580,66 @@ async def classify_request(session, provider, user_text):
     except Exception as e:
         print(f"[classify_request] ERROR: {e}", flush=True)
         return default
+
+
+async def ask_xkiro(session, messages):
+    key = os.getenv("XKIRO_API_KEY")
+    model = os.getenv("XKIRO_MODEL", "qwen/qwen3.8-max:free")
+    base_url = os.getenv("XKIRO_BASE_URL", "https://api.xkiro.com/v1").rstrip("/")
+
+    if not key:
+        raise RuntimeError("XKiro API key is missing")
+
+    clean_messages = []
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = str(message.get("content", ""))
+
+        if not content:
+            continue
+
+        if role not in ("system", "user", "assistant"):
+            role = "user"
+
+        clean_messages.append({
+            "role": role,
+            "content": content,
+        })
+
+    if not clean_messages:
+        raise RuntimeError("XKiro received empty messages")
+
+    payload = {
+        "model": model,
+        "messages": clean_messages,
+    }
+
+    status, body = await _post(
+        session,
+        f"{base_url}/chat/completions",
+        {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+
+    if status >= 400:
+        raise RuntimeError(
+            f"XKiro HTTP {status}: {body[:500]}"
+        )
+
+    try:
+        data = json.loads(body)
+        answer = data["choices"][0]["message"]["content"]
+
+        if not answer:
+            raise RuntimeError("XKiro returned empty answer")
+
+        return str(answer).strip()
+
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        raise RuntimeError(
+            f"Unexpected XKiro response: {body[:500]}"
+        )
