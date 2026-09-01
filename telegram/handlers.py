@@ -112,11 +112,33 @@ async def handle_new_chat_members(message: types.Message):
     await message.answer(answer)
 
 
+async def _animate_kasper(message):
+    frames = ["✦ Kasper", "✧ Kasper", "· Kasper", "✧ Kasper"]
+    i = 0
+    try:
+        while True:
+            try:
+                await message.edit_text(frames[i % len(frames)])
+            except Exception:
+                pass
+            i += 1
+            await asyncio.sleep(0.4)
+    except asyncio.CancelledError:
+        pass
+
+
 async def handle_message(message: types.Message):
     is_group = message.chat.type in ("group", "supergroup")
     text = (message.text or "").strip()
     if not text:
         return
+
+    animation_message = None
+    animation_task = None
+
+    if not is_group:
+        animation_message = await message.answer("✦ Kasper")
+        animation_task = asyncio.create_task(_animate_kasper(animation_message))
 
     is_reply_to_bot = False
     if is_group and message.reply_to_message:
@@ -387,7 +409,22 @@ async def handle_message(message: types.Message):
             chat_id=chat_id,
         )
 
-        if is_group:
+        if animation_task:
+            animation_task.cancel()
+            try:
+                await animation_task
+            except asyncio.CancelledError:
+                pass
+
+        if animation_message:
+            try:
+                await animation_message.edit_text(answer, parse_mode="Markdown")
+            except Exception:
+                try:
+                    await animation_message.edit_text(answer)
+                except Exception:
+                    await message.answer(answer)
+        elif is_group:
             try:
                 await message.reply(answer, parse_mode="Markdown")
             except Exception:
