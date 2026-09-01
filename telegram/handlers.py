@@ -393,17 +393,26 @@ async def handle_message(message: types.Message):
                 print(f"[Kasper] Web search ERROR: {e}", flush=True)
                 search_context = ""
 
-    if not messages or messages[-1]["content"] != text:
-        user_content = text
-        if search_context:
-            user_content = f"{search_context}\n\nВопрос пользователя: {text}"
+    # Всегда добавляем текущий запрос.
+    # Если есть результаты Tavily — обязательно передаём их в AI вместе с вопросом.
+    user_content = text
 
-        messages.append(
-            {
-                "role": "user",
-                "content": user_content,
-            }
+    if search_context:
+        user_content = (
+            "ВАЖНО: ниже приведены результаты веб-поиска Tavily. "
+            "Используй их для ответа на вопрос пользователя. "
+            "Не говори, что веб-поиск недоступен, если результаты "
+            "переданы ниже.\n\n"
+            f"{search_context}\n\n"
+            f"Вопрос пользователя: {text}"
         )
+
+    messages.append(
+        {
+            "role": "user",
+            "content": user_content,
+        }
+    )
     try:
         print(
             f"[Kasper] Sending {len(messages)} messages to router...",
