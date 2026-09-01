@@ -136,10 +136,6 @@ async def handle_message(message: types.Message):
     animation_message = None
     animation_task = None
 
-    if not is_group:
-        animation_message = await message.answer("✦ Kasper")
-        animation_task = asyncio.create_task(_animate_kasper(animation_message))
-
     is_reply_to_bot = False
     if is_group and message.reply_to_message:
         bot_info = await message.bot.get_me()
@@ -374,6 +370,12 @@ async def handle_message(message: types.Message):
             flush=True,
         )
 
+        if not is_group:
+            animation_message = await message.answer("✦ Kasper")
+            animation_task = asyncio.create_task(
+                _animate_kasper(animation_message)
+            )
+
         result = await ask(messages)
 
         if isinstance(result, dict):
@@ -446,6 +448,20 @@ async def handle_message(message: types.Message):
         )
 
         error_text = f"⚠️ Ошибка AI: {e}"
+
+        if animation_task:
+            animation_task.cancel()
+            try:
+                await animation_task
+            except asyncio.CancelledError:
+                pass
+
+        if animation_message:
+            try:
+                await animation_message.edit_text(error_text)
+                return
+            except Exception:
+                pass
 
         if is_group:
             await message.reply(error_text)
