@@ -21,6 +21,24 @@ FAST_CLASSIFY_PATTERN = re.compile(
 )
 
 
+WEB_FAST_PATTERN = re.compile(
+    r"\b("
+    r"знаешь мем|что за мем|какой мем|откуда мем|"
+    r"что такое|кто такой|кто такая|что значит|что означает|"
+    r"откуда взялось|откуда появился|почему все говорят|"
+    r"курс валют|курс доллара|курс евро|курс рубля|"
+    r"сколько стоит|какая цена|цена сейчас|"
+    r"новости|последние новости|что произошло|что случилось|"
+    r"сегодня|сейчас|последний|последняя|актуальн"
+    r")\w*",
+    re.IGNORECASE,
+)
+
+
+def needs_fast_web_search(text: str) -> bool:
+    return bool(WEB_FAST_PATTERN.search(text))
+
+
 def needs_smart_classification(text: str) -> bool:
     return bool(FAST_CLASSIFY_PATTERN.search(text))
 
@@ -257,13 +275,23 @@ async def handle_message(message: types.Message):
                 "content": content,
             }
         )
-
     search_context = ""
     classification = None
 
-    # Быстрый путь: обычные вопросы сразу отправляются в основной AI.
-    # Классификатор нужен только для специальных запросов.
-    if needs_smart_classification(text):
+    # Очевидные web-запросы сразу идут в Tavily без AI-классификатора.
+    if needs_fast_web_search(text):
+        query = text
+        print(f"[Kasper] Fast web search: {query}", flush=True)
+
+        try:
+            results = await tavily_search(query)
+            search_context = format_search_results(results)
+        except Exception as e:
+            print(f"[Kasper] Fast web search ERROR: {e}", flush=True)
+            search_context = ""
+
+    # Музыка, сайты и другие специальные запросы идут через классификатор.
+    elif needs_smart_classification(text):
         try:
             async with aiohttp.ClientSession() as _classify_session:
                 for _provider_try in get_provider_order():
