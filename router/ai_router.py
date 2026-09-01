@@ -531,6 +531,47 @@ async def generate_website_html(session, provider, description):
     return raw
 
 
+async def check_site_description(session, provider, description):
+    system_prompt = (
+        'Тебе дано краткое описание сайта, который просит сделать пользователь. '
+        'Определи, достаточно ли деталей, чтобы сделать конкретный, осмысленный сайт '
+        '(понятна тематика/ниша, есть хоть какой-то намёк на стиль или назначение), '
+        'или описание слишком скудное (буквально пара слов без какой-либо конкретики, '
+        'например просто "сайт", "лендинг", "сделай сайт"). '
+        'Если тематика понятна (например "сайт одежды в стиле iOS", "лендинг кофейни") — '
+        'этого уже достаточно, sufficient=true, остальное можно додумать самому. '
+        'Если описание крайне скудное — sufficient=false и задай ОДИН короткий '
+        'уточняющий вопрос на русском (какой сайт нужен, для чего, есть ли пожелания '
+        'по стилю/цветам). Ответь СТРОГО JSON без пояснений: '
+        '{"sufficient": true/false, "question": "текст вопроса или пусто"}'
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": description},
+    ]
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras", "openai"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            raise RuntimeError(f"check_site_description: unsupported provider {provider}")
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        return {
+            "sufficient": bool(data.get("sufficient", True)),
+            "question": str(data.get("question", "")).strip(),
+        }
+    except Exception as e:
+        print(f"[check_site_description] {provider} ERROR: {e}", flush=True)
+        raise
+
+
 async def classify_request(session, provider, user_text):
     system_prompt = (
         'Проанализируй сообщение пользователя и определи ОДНОВРЕМЕННО три вещи. '

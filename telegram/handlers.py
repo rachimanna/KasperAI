@@ -4,12 +4,14 @@ import re
 from aiogram import Dispatcher, types
 
 from database.db import get_or_create_user, save_message, get_history, check_and_increment_limit, get_limit_status
-from router.ai_router import ask, ask_provider, get_provider_order, classify_request, classify_is_addressed, generate_website_html
+from router.ai_router import ask, ask_provider, get_provider_order, classify_request, classify_is_addressed, generate_website_html, check_site_description
 from router.web_search import tavily_search, format_search_results
 from router.music import download_music
 import aiohttp
 
 TRIGGER_PATTERN = re.compile(r"каспер|kasper", re.IGNORECASE)
+
+PENDING_SITE_REQUESTS = {}
 
 WELCOME_PROMPT = (
     "Ты — Kasper AI, ИИ-помощник в Telegram. Тебя только что добавили "
@@ -152,6 +154,37 @@ async def handle_message(message: types.Message):
 
     chat_id = message.chat.id if is_group else None
 
+    if user_id in PENDING_SITE_REQUESTS:
+        pending_description = PENDING_SITE_REQUESTS.pop(user_id)
+        full_description = f"{pending_description}\n\nДополнительные детали от пользователя: {text}"
+
+        allowed, remaining = await check_and_increment_limit(user_id, daily_limit=20, telegram_id=message.from_user.id)
+        if not allowed:
+            await message.answer('⛔ Лимит исчерпан, ждите сброса.')
+            return
+
+        await message.answer("🌐 Создаю сайт, подождите...")
+        html_code = None
+        async with aiohttp.ClientSession() as _gen_session_pending:
+            for _provider_try_pending in get_provider_order():
+                try:
+                    html_code = await generate_website_html(_gen_session_pending, _provider_try_pending, full_description)
+                    break
+                except Exception as _e_gen_pending:
+                    print(f"[generate_website_html] {_provider_try_pending} ERROR: {_e_gen_pending}", flush=True)
+                    continue
+        if html_code:
+            import os as _os
+            _os.makedirs("generated_sites", exist_ok=True)
+            _site_path = f"generated_sites/site_{user_id}_{message.message_id}.html"
+            with open(_site_path, "w", encoding="utf-8") as _f:
+                _f.write(html_code)
+            site_doc = types.InputFile(_site_path)
+            await message.answer_document(site_doc, caption="🌐 Готово! Открой файл в браузере.")
+        else:
+            await message.answer("⚠️ Не удалось создать сайт.")
+        return
+
     allowed, remaining = await check_and_increment_limit(user_id, daily_limit=20, telegram_id=message.from_user.id)
     if not allowed:
         await message.answer('⛔ Лимит исчерпан, ждите сброса.')
@@ -258,6 +291,25 @@ async def handle_message(message: types.Message):
         if classification["is_website_request"] and classification["site_description"]:
             site_description = classification["site_description"]
             print(f"[Kasper] Website request: {site_description}", flush=True)
+
+            sufficiency = None
+            try:
+                async with aiohttp.ClientSession() as _check_session:
+                    for _provider_try_check in get_provider_order():
+                        try:
+                            sufficiency = await check_site_description(_check_session, _provider_try_check, site_description)
+                            break
+                        except Exception as _e_check:
+                            print(f"[check_site_description] {_provider_try_check} ERROR: {_e_check}", flush=True)
+                            continue
+            except Exception as e:
+                print(f"[Kasper] check_site_description ERROR: {e}", flush=True)
+
+            if sufficiency and not sufficiency["sufficient"] and sufficiency["question"]:
+                PENDING_SITE_REQUESTS[user_id] = site_description
+                await message.answer(sufficiency["question"])
+                return
+
             await message.answer("🌐 Создаю сайт, подождите...")
             html_code = None
             async with aiohttp.ClientSession() as _gen_session:
