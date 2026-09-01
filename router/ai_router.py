@@ -125,7 +125,7 @@ async def _call_groq_with_key(session, key, model, url, clean_messages):
         "messages": clean_messages,
     }
     if "gpt-oss" in model:
-        payload["reasoning_effort"] = "medium"
+        payload["reasoning_effort"] = os.getenv("GROQ_REASONING_EFFORT", "low")
 
     status, body = await _post(
         session,

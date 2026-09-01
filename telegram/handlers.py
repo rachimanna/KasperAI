@@ -11,6 +11,19 @@ import aiohttp
 
 TRIGGER_PATTERN = re.compile(r"каспер|kasper", re.IGNORECASE)
 
+# Обычные сообщения не требуют отдельного AI-запроса классификатору.
+# Это экономит один сетевой запрос и заметно ускоряет стандартные ответы.
+FAST_CLASSIFY_PATTERN = re.compile(
+    r"\b(скач|скача|музык|песн|трек|включи|сделай сайт|создай сайт|лендинг|портфолио|"
+    r"новост|погод|курс валют|курс доллара|курс евро|цена|стоимость|актуальн|"
+    r"сейчас|сегодня|вчера|завтра|последн|найди|поищи|расписани|матч|событи)\w*",
+    re.IGNORECASE,
+)
+
+
+def needs_smart_classification(text: str) -> bool:
+    return bool(FAST_CLASSIFY_PATTERN.search(text))
+
 PENDING_SITE_REQUESTS = {}
 
 WELCOME_PROMPT = (
@@ -97,22 +110,6 @@ async def handle_new_chat_members(message: types.Message):
         )
 
     await message.answer(answer)
-
-
-async def _animate_thinking(thinking_message: types.Message):
-    dots_cycle = [".", "..", "..."]
-    i = 0
-    try:
-        while True:
-            dots = dots_cycle[i % len(dots_cycle)]
-            try:
-                await thinking_message.edit_text(f"`thinking{dots}`", parse_mode="Markdown")
-            except Exception:
-                pass
-            i += 1
-            await asyncio.sleep(0.6)
-    except asyncio.CancelledError:
-        pass
 
 
 async def handle_message(message: types.Message):
@@ -245,17 +242,30 @@ async def handle_message(message: types.Message):
 
     search_context = ""
     classification = None
-    try:
-        async with aiohttp.ClientSession() as _classify_session:
-            for _provider_try in get_provider_order():
-                try:
-                    classification = await classify_request(_classify_session, _provider_try, text)
-                    break
-                except Exception as _e_classify:
-                    print(f"[classify_request] {_provider_try} ERROR: {_e_classify}", flush=True)
-                    continue
-    except Exception as e:
-        print(f"[Kasper] Classify ERROR: {e}", flush=True)
+
+    # Быстрый путь: обычные вопросы сразу отправляются в основной AI.
+    # Классификатор нужен только для специальных запросов.
+    if needs_smart_classification(text):
+        try:
+            async with aiohttp.ClientSession() as _classify_session:
+                for _provider_try in get_provider_order():
+                    try:
+                        classification = await classify_request(
+                            _classify_session,
+                            _provider_try,
+                            text,
+                        )
+                        break
+                    except Exception as _e_classify:
+                        print(
+                            f"[classify_request] {_provider_try} ERROR: {_e_classify}",
+                            flush=True,
+                        )
+                        continue
+        except Exception as e:
+            print(f"[Kasper] Classify ERROR: {e}", flush=True)
+    else:
+        print("[Kasper] Fast path: classifier skipped.", flush=True)
 
     if classification:
         if classification["is_music_request"] and classification["track_query"]:
@@ -336,14 +346,6 @@ async def handle_message(message: types.Message):
                 "content": user_content,
             }
         )
-
-    thinking_message = None
-    animation_task = None
-
-    if not is_group:
-        thinking_message = await message.answer("`thinking.`", parse_mode="Markdown")
-        animation_task = asyncio.create_task(_animate_thinking(thinking_message))
-
     try:
         print(
             f"[Kasper] Sending {len(messages)} messages to router...",
@@ -391,32 +393,16 @@ async def handle_message(message: types.Message):
             except Exception:
                 await message.reply(answer)
         else:
-            animation_task.cancel()
             try:
-                await animation_task
-            except asyncio.CancelledError:
-                pass
-
-            try:
-                await thinking_message.edit_text(answer, parse_mode="Markdown")
+                await message.answer(answer, parse_mode="Markdown")
             except Exception:
-                try:
-                    await thinking_message.edit_text(answer)
-                except Exception:
-                    await message.answer(answer)
+                await message.answer(answer)
 
         if _send_as_file:
             doc = types.InputFile(_send_as_file)
             await message.answer_document(doc)
 
     except Exception as e:
-        if animation_task:
-            animation_task.cancel()
-            try:
-                await animation_task
-            except asyncio.CancelledError:
-                pass
-
         print(
             f"[Kasper] AI ERROR: {e}",
             flush=True,
@@ -426,13 +412,9 @@ async def handle_message(message: types.Message):
 
         if is_group:
             await message.reply(error_text)
-        elif thinking_message:
-            try:
-                await thinking_message.edit_text(error_text)
-            except Exception:
-                await message.answer(error_text)
         else:
             await message.answer(error_text)
+
 
 
 def register_handlers(dp: Dispatcher):
