@@ -4,7 +4,7 @@ import re
 from aiogram import Dispatcher, types
 
 from database.db import get_or_create_user, save_message, get_history, check_and_increment_limit, get_limit_status
-from router.ai_router import ask, ask_provider, get_provider_order, classify_request, generate_website_html
+from router.ai_router import ask, ask_provider, get_provider_order, classify_request, classify_is_addressed, generate_website_html
 from router.web_search import tavily_search, format_search_results
 from router.music import download_music
 import aiohttp
@@ -127,6 +127,23 @@ async def handle_message(message: types.Message):
 
     if is_group and not is_reply_to_bot and not TRIGGER_PATTERN.search(text):
         return
+
+    if is_group and not is_reply_to_bot:
+        addressed = True
+        try:
+            async with aiohttp.ClientSession() as _addr_session:
+                for _provider_try_addr in get_provider_order():
+                    try:
+                        addressed = await classify_is_addressed(_addr_session, _provider_try_addr, text)
+                        break
+                    except Exception as _e_addr:
+                        print(f"[classify_is_addressed] {_provider_try_addr} ERROR: {_e_addr}", flush=True)
+                        continue
+        except Exception as e:
+            print(f"[Kasper] classify_is_addressed ERROR: {e}", flush=True)
+
+        if not addressed:
+            return
 
     user_id = await get_or_create_user(
         telegram_id=message.from_user.id,
