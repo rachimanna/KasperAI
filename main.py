@@ -35,6 +35,7 @@ async def on_startup(dp):
     await dp.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
+        BotCommand("osint", "Найти Telegram ID по юзернейму"),
     ])
 
     print("Database: OK")

@@ -93,6 +93,21 @@ async def get_or_create_user(telegram_id, username=None):
 
         await db.commit()
 
+
+async def find_telegram_id_by_username(username):
+    username = username.lstrip("@").strip().lower()
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT telegram_id FROM users
+            WHERE LOWER(username) = ?
+            LIMIT 1
+            """,
+            (username,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
         cursor = await db.execute(
             "SELECT id FROM users WHERE telegram_id = ?",
             (telegram_id,),
