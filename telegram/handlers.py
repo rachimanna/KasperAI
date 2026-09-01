@@ -259,7 +259,12 @@ async def handle_message(message: types.Message):
         "любой текст, который пользователь может захотеть скопировать "
         "целиком — обязательно оформляй его в блок кода тройными "
         "обратными кавычками (```), чтобы в Telegram появилась кнопка "
-        "копирования. Обычный текст ответа пиши без разметки."
+        "копирования. Обычный текст ответа пиши без разметки. "
+        "Если ниже передан контекст веб-поиска, обязательно используй "
+        "его как источник фактов. Не выдумывай происхождение мемов, "
+        "новости, курсы, цены и другие актуальные сведения. Если "
+        "найденные результаты не содержат ответа, честно скажи, что "
+        "надёжной информации не найдено."
     )
 
     messages = [
@@ -286,6 +291,12 @@ async def handle_message(message: types.Message):
         try:
             results = await tavily_search(query)
             search_context = format_search_results(results)
+
+            if search_context:
+                print("[Kasper] Fast web search: results received", flush=True)
+            else:
+                print("[Kasper] Fast web search: no results", flush=True)
+
         except Exception as e:
             print(f"[Kasper] Fast web search ERROR: {e}", flush=True)
             search_context = ""
@@ -312,6 +323,7 @@ async def handle_message(message: types.Message):
             print(f"[Kasper] Classify ERROR: {e}", flush=True)
     else:
         print("[Kasper] Fast path: classifier skipped.", flush=True)
+
 
     if classification:
         if classification["is_music_request"] and classification["track_query"]:
