@@ -561,7 +561,7 @@ async def classify_request(session, provider, user_text):
         elif provider in ("groq", "cerebras", "openai"):
             raw = await ask_openai_compatible(session, provider, messages)
         else:
-            return default
+            raise RuntimeError(f"classify_request: unsupported provider {provider}")
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.strip("`")
@@ -578,8 +578,8 @@ async def classify_request(session, provider, user_text):
             "search_query": str(data.get("search_query", "")).strip(),
         }
     except Exception as e:
-        print(f"[classify_request] ERROR: {e}", flush=True)
-        return default
+        print(f"[classify_request] {provider} ERROR: {e}", flush=True)
+        raise
 
 
 async def classify_is_addressed(session, provider, user_text):
@@ -604,7 +604,7 @@ async def classify_is_addressed(session, provider, user_text):
         elif provider in ("groq", "cerebras", "openai"):
             raw = await ask_openai_compatible(session, provider, messages)
         else:
-            return True
+            raise RuntimeError(f"classify_is_addressed: unsupported provider {provider}")
         raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.strip("`")
@@ -614,8 +614,8 @@ async def classify_is_addressed(session, provider, user_text):
         data = json.loads(raw)
         return bool(data.get("addressed_to_bot"))
     except Exception as e:
-        print(f"[classify_is_addressed] ERROR: {e}", flush=True)
-        return True
+        print(f"[classify_is_addressed] {provider} ERROR: {e}", flush=True)
+        raise
 
 
 async def ask_xkiro(session, messages):
