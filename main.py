@@ -32,10 +32,18 @@ async def on_startup(dp):
     await init_db()
 
     from aiogram.types import BotCommand
+
+    # Полностью очищаем старые команды Telegram,
+    # включая оставшийся /osint в меню.
+    try:
+        await dp.bot.delete_my_commands()
+    except Exception as e:
+        print(f"[Commands] default scope cleanup error: {e}", flush=True)
+
+    # Устанавливаем только актуальные команды.
     await dp.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
-        BotCommand("osint", "Найти Telegram ID по юзернейму"),
     ])
 
     print("Database: OK")
