@@ -93,6 +93,13 @@ async def get_or_create_user(telegram_id, username=None):
 
         await db.commit()
 
+        cursor = await db.execute(
+            "SELECT id FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
 
 async def find_telegram_id_by_username(username):
     username = username.lstrip("@").strip().lower()
@@ -104,13 +111,6 @@ async def find_telegram_id_by_username(username):
             LIMIT 1
             """,
             (username,),
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else None
-
-        cursor = await db.execute(
-            "SELECT id FROM users WHERE telegram_id = ?",
-            (telegram_id,),
         )
         row = await cursor.fetchone()
         return row[0] if row else None
