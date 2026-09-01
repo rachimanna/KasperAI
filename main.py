@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher
 from aiogram import executor
 
 from database.db import init_db
+from router.ai_router import init_http_session, close_http_session
 from telegram.handlers import register_handlers
 
 
@@ -29,6 +30,7 @@ def run_health_server():
 
 
 async def on_startup(dp):
+    await init_http_session()
     await init_db()
 
     from aiogram.types import BotCommand
@@ -50,7 +52,12 @@ async def on_startup(dp):
     print("Kasper AI is running.")
 
 
+async def on_shutdown(dp):
+    await close_http_session()
+
+
 def main():
+
     load_dotenv(override=True)
 
     logging.basicConfig(
@@ -81,6 +88,7 @@ def main():
         dp,
         skip_updates=True,
         on_startup=on_startup,
+        on_shutdown=on_shutdown,
         loop=loop,
     )
 

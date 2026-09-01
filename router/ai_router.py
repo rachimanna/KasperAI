@@ -15,6 +15,33 @@ TIMEOUT = aiohttp.ClientTimeout(
 )
 
 
+_http_session = None
+
+
+async def init_http_session():
+    global _http_session
+
+    if _http_session is None or _http_session.closed:
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=50,
+            ttl_dns_cache=300,
+        )
+        _http_session = aiohttp.ClientSession(
+            timeout=TIMEOUT,
+            connector=connector,
+        )
+
+
+async def close_http_session():
+    global _http_session
+
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+
+    _http_session = None
+
+
 async def _post(session, url, headers, payload):
     async with session.post(
         url,
@@ -119,6 +146,8 @@ async def ask_gemini(session, messages):
         )
 
 
+_groq_key_index = 0
+
 async def _call_groq_with_key(session, key, model, url, clean_messages):
     payload = {
         "model": model,
@@ -182,13 +211,23 @@ async def ask_openai_compatible(session, provider, messages):
         if not keys:
             raise RuntimeError("groq API key is missing")
 
+        # Round-robin: распределяем параллельные запросы между ключами.
+        global _groq_key_index
+        start_index = _groq_key_index % len(keys)
+        _groq_key_index = (_groq_key_index + 1) % len(keys)
+
         last_error = None
-        for i, key in enumerate(keys):
+        for offset in range(len(keys)):
+            i = (start_index + offset) % len(keys)
+            key = keys[i]
             try:
-                return await _call_groq_with_key(session, key, model, url, clean_messages)
+                return await _call_groq_with_key(
+                    session, key, model, url, clean_messages
+                )
             except Exception as e:
                 last_error = e
                 print(f"[groq] key #{i+1} failed: {e}", flush=True)
+
         raise last_error
 
     elif provider == "cerebras":
@@ -250,7 +289,7 @@ async def ask_openai_compatible(session, provider, messages):
         "messages": clean_messages,
     }
     if provider == "groq" and "gpt-oss" in model:
-        payload["reasoning_effort"] = "medium"
+        payload["reasoning_effort"] = os.getenv("GROQ_REASONING_EFFORT", "low")
 
     status, body = await _post(
         session,
@@ -352,38 +391,37 @@ async def ask(messages):
 
     errors = []
 
-    async with aiohttp.ClientSession(
-        timeout=TIMEOUT
-    ) as session:
+    await init_http_session()
+    session = _http_session
 
-        for provider in get_provider_order():
-            try:
-                answer = await ask_provider(
-                    session,
-                    provider,
-                    messages,
-                )
+    for provider in get_provider_order():
+        try:
+            answer = await ask_provider(
+                session,
+                provider,
+                messages,
+            )
 
-                return {
+            return {
+                "provider": provider,
+                "answer": answer,
+                "errors": errors,
+            }
+
+        except Exception as e:
+            error = str(e)
+
+            print(
+                f"[{provider}] ERROR: {error}",
+                flush=True,
+            )
+
+            errors.append(
+                {
                     "provider": provider,
-                    "answer": answer,
-                    "errors": errors,
+                    "error": error,
                 }
-
-            except Exception as e:
-                error = str(e)
-
-                print(
-                    f"[{provider}] ERROR: {error}",
-                    flush=True,
-                )
-
-                errors.append(
-                    {
-                        "provider": provider,
-                        "error": error,
-                    }
-                )
+            )
 
     raise RuntimeError(
         "All AI providers failed: "
