@@ -3,8 +3,8 @@ import re
 
 from aiogram import Dispatcher, types
 
-from database.db import get_or_create_user, save_message, get_history, check_and_increment_limit, get_limit_status, find_telegram_id_by_username
-from router.ai_router import ask, ask_provider, get_provider_order, classify_request, classify_is_addressed, generate_website_html, check_site_description
+from database.db import get_or_create_user, save_message, get_history, check_and_increment_limit, get_limit_status
+from router.ai_router import ask, ask_provider, get_provider_order, classify_request, generate_website_html, check_site_description
 from router.web_search import tavily_search, format_search_results
 from router.music import download_music
 import aiohttp
@@ -12,7 +12,6 @@ import aiohttp
 TRIGGER_PATTERN = re.compile(r"каспер|kasper", re.IGNORECASE)
 
 PENDING_SITE_REQUESTS = {}
-PENDING_OSINT_REQUESTS = set()
 
 WELCOME_PROMPT = (
     "Ты — Kasper AI, ИИ-помощник в Telegram. Тебя только что добавили "
@@ -42,7 +41,6 @@ async def cmd_help(message: types.Message):
         "/help — помощь\n"
         "/memory — память\n"
         "/project — проекты\n"
-        "/osint — найти Telegram ID по юзернейму\n"
         "/status — состояние системы"
     )
 
@@ -59,68 +57,6 @@ async def cmd_limit(message: types.Message):
     used, remaining = await get_limit_status(user_id, daily_limit=20)
     text = "\U0001F4CA \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u043e \u0441\u0435\u0433\u043e\u0434\u043d\u044f: " + str(used) + "/20" + chr(10) + "\u041e\u0441\u0442\u0430\u043b\u043e\u0441\u044c: " + str(remaining)
     await message.answer(text)
-
-
-async def cmd_osint(message: types.Message):
-    user_id = await get_or_create_user(
-        telegram_id=message.from_user.id,
-        username=message.from_user.username,
-    )
-    PENDING_OSINT_REQUESTS.add(user_id)
-    await message.answer(
-        "🕵️ <b>OSINT-поиск по Telegram</b>\n\n"
-        "Отправьте юзернейм (например <code>@durov</code>) "
-        "человека, чтобы найти его Telegram ID.",
-        parse_mode="HTML",
-    )
-
-
-async def handle_osint_query(message: types.Message, user_id: int):
-    query = message.text.strip()
-
-    thinking = await message.answer("<code>🔍 Ищу.</code>", parse_mode="HTML")
-    for dots in [".", "..", "...", ""]:
-        await asyncio.sleep(0.4)
-        try:
-            await thinking.edit_text(f"<code>🔍 Ищу{dots}</code>", parse_mode="HTML")
-        except Exception:
-            pass
-
-    username_candidate = query.lstrip("@").strip()
-    found_id = None
-    found_username = None
-
-    if username_candidate and not username_candidate.replace("+", "").isdigit():
-        try:
-            chat = await message.bot.get_chat(f"@{username_candidate}")
-            found_id = chat.id
-            found_username = chat.username or username_candidate
-        except Exception as e:
-            print(f"[osint] get_chat ERROR: {e}", flush=True)
-
-    if not found_id and username_candidate:
-        db_id = await find_telegram_id_by_username(username_candidate)
-        if db_id:
-            found_id = db_id
-            found_username = username_candidate
-
-    if found_id:
-        result_text = (
-            f"<code>✅ Найдено\n"
-            f"Username: @{found_username}\n"
-            f"Telegram ID: {found_id}</code>"
-        )
-    else:
-        result_text = (
-            "<code>❌ Не найдено.\n"
-            "Человек либо не писал этому боту / общим группам,\n"
-            "либо ввёл неверный юзернейм.</code>"
-        )
-
-    try:
-        await thinking.edit_text(result_text, parse_mode="HTML")
-    except Exception:
-        await message.answer(result_text, parse_mode="HTML")
 
 
 async def handle_new_chat_members(message: types.Message):
@@ -194,32 +130,10 @@ async def handle_message(message: types.Message):
     if is_group and not is_reply_to_bot and not TRIGGER_PATTERN.search(text):
         return
 
-    if is_group and not is_reply_to_bot:
-        addressed = True
-        try:
-            async with aiohttp.ClientSession() as _addr_session:
-                for _provider_try_addr in get_provider_order():
-                    try:
-                        addressed = await classify_is_addressed(_addr_session, _provider_try_addr, text)
-                        break
-                    except Exception as _e_addr:
-                        print(f"[classify_is_addressed] {_provider_try_addr} ERROR: {_e_addr}", flush=True)
-                        continue
-        except Exception as e:
-            print(f"[Kasper] classify_is_addressed ERROR: {e}", flush=True)
-
-        if not addressed:
-            return
-
     user_id = await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
     )
-
-    if user_id in PENDING_OSINT_REQUESTS:
-        PENDING_OSINT_REQUESTS.discard(user_id)
-        await handle_osint_query(message, user_id)
-        return
 
     chat_id = message.chat.id if is_group else None
 
@@ -533,10 +447,6 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         cmd_limit,
         commands=["limit"],
-    )
-    dp.register_message_handler(
-        cmd_osint,
-        commands=["osint"],
     )
     dp.register_message_handler(
         handle_new_chat_members,
