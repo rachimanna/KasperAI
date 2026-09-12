@@ -26,6 +26,7 @@ from router.game_logic import (
     handle_vote_action,
     phase_checker_loop,
     role_reveal_text,
+    capture_last_words,
 )
 from router.ai_router import (
     ask,
@@ -240,6 +241,13 @@ async def handle_message(message: types.Message):
     is_group = message.chat.type in ("group", "supergroup")
     text = (message.text or "").strip()
     if not text:
+        return
+
+    # Если пользователь сейчас в личке и от него ждут "последние слова"
+    # после гибели в игре — перехватываем сообщение здесь, до обычного
+    # AI-чата, и не отвечаем как ассистент.
+    if not is_group and capture_last_words(message.from_user.id, text):
+        await message.answer("💬 Принято, твои последние слова переданы в группу.")
         return
 
     animation_message = None
@@ -862,6 +870,10 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
 
     if not await is_player_in_game(game_id, voter_user_id):
         await callback_query.answer("Ты не участвуешь в этой игре.", show_alert=True)
+        return
+
+    if target_user_id == voter_user_id:
+        await callback_query.answer("Нельзя голосовать за самого себя 🙅", show_alert=True)
         return
 
     await handle_vote_action(game_id, phase_number, voter_user_id, target_user_id)
