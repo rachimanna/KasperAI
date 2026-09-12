@@ -10,6 +10,7 @@ from aiogram import executor
 
 from database.db import init_db
 from router.ai_router import init_http_session, close_http_session
+from router.game_logic import phase_checker_loop
 from telegram.handlers import register_handlers
 
 
@@ -47,6 +48,12 @@ async def on_startup(dp):
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
     ])
+
+    # Фоновая задача мини-игры "Теневой город": раз в несколько секунд
+    # проверяет БД на игры с истёкшей фазой (ночь/голосование) и
+    # продвигает их. Живёт в games.phase_ends_at, поэтому переживает
+    # пересыпание/передеплой Render.
+    asyncio.create_task(phase_checker_loop(dp.bot))
 
     print("Database: OK")
     print("Kasper AI is running.")
