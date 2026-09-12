@@ -1,4 +1,3 @@
-
 import asyncio
 import logging
 import os
@@ -13,6 +12,7 @@ from database.db import init_db
 from router.ai_router import init_http_session, close_http_session
 from router.game_logic import phase_checker_loop
 from telegram.handlers import register_handlers
+from config.settings import ADMIN_IDS
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -35,7 +35,7 @@ async def on_startup(dp):
     await init_http_session()
     await init_db()
 
-    from aiogram.types import BotCommand
+    from aiogram.types import BotCommand, BotCommandScopeChat
 
     # Полностью очищаем старые команды Telegram,
     # включая оставшийся /osint в меню.
@@ -44,13 +44,34 @@ async def on_startup(dp):
     except Exception as e:
         print(f"[Commands] default scope cleanup error: {e}", flush=True)
 
-    # Устанавливаем только актуальные команды.
+    # Устанавливаем актуальные команды для всех пользователей.
     await dp.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
         BotCommand("game", "Начать игру «Теневой город»"),
         BotCommand("stopgame", "Остановить текущую игру"),
     ])
+
+    # Админские команды показываем в подсказках только самим админам —
+    # через scope=BotCommandScopeChat(chat_id=admin_id), а не в общем
+    # меню, иначе их увидят и смогут попытаться вызвать все пользователи.
+    admin_commands = [
+        BotCommand("start", "Запустить бота"),
+        BotCommand("limit", "Мой лимит запросов"),
+        BotCommand("game", "Начать игру «Теневой город»"),
+        BotCommand("stopgame", "Остановить текущую игру"),
+        BotCommand("ban", "Забанить пользователя (ответом/@username/id)"),
+        BotCommand("unban", "Разбанить пользователя (ответом/@username/id)"),
+        BotCommand("broadcast", "Рассылка всем пользователям"),
+    ]
+    for admin_id in ADMIN_IDS:
+        try:
+            await dp.bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(chat_id=admin_id),
+            )
+        except Exception as e:
+            print(f"[Commands] admin scope error for {admin_id}: {e}", flush=True)
 
     # Фоновая задача мини-игры "Теневой город": раз в несколько секунд
     # проверяет БД на игры с истёкшей фазой (ночь/голосование) и
