@@ -25,6 +25,7 @@ from router.game_logic import (
     handle_night_action,
     handle_vote_action,
     phase_checker_loop,
+    role_reveal_text,
 )
 from router.ai_router import (
     ask,
@@ -710,8 +711,17 @@ async def cmd_stopgame(message: types.Message):
         return
 
     game_id = existing_game[0]
+    game_status = existing_game[2]
     await set_game_status(game_id, "finished")
-    await message.answer("🛑 Игра остановлена.")
+
+    if game_status == "lobby":
+        await message.answer("🛑 Игра остановлена.")
+    else:
+        players = await get_game_players(game_id)
+        await message.answer(
+            "🛑 Игра остановлена.\n" + role_reveal_text(players),
+            parse_mode="HTML",
+        )
 
 
 async def handle_game_join(callback_query: types.CallbackQuery):
@@ -867,10 +877,18 @@ async def handle_game_stop(callback_query: types.CallbackQuery):
         return
 
     game_id = game[0]
+    game_status = game[2]
     await set_game_status(game_id, "finished")
 
     try:
-        await callback_query.message.edit_text("🛑 Игра остановлена.")
+        if game_status == "lobby":
+            await callback_query.message.edit_text("🛑 Игра остановлена.")
+        else:
+            players = await get_game_players(game_id)
+            await callback_query.message.edit_text(
+                "🛑 Игра остановлена.\n" + role_reveal_text(players),
+                parse_mode="HTML",
+            )
     except Exception:
         pass
 
