@@ -69,6 +69,18 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER,
+                summary TEXT NOT NULL DEFAULT '',
+                last_summarized_message_id INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
         await db.commit()
 
 
@@ -156,6 +168,102 @@ async def get_history(user_id, limit=20, chat_id=None):
         rows = await cursor.fetchall()
         rows.reverse()
         return rows
+
+
+async def get_conversation_summary(user_id, chat_id=None):
+    """
+    Возвращает (summary: str, last_summarized_message_id: int) для пользователя/чата.
+    Если записи ещё нет — ("", 0).
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        if chat_id is not None:
+            cursor = await db.execute(
+                """
+                SELECT summary, last_summarized_message_id
+                FROM conversation_summaries
+                WHERE chat_id = ?
+                """,
+                (chat_id,),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT summary, last_summarized_message_id
+                FROM conversation_summaries
+                WHERE user_id = ? AND chat_id IS NULL
+                """,
+                (user_id,),
+            )
+        row = await cursor.fetchone()
+        return row if row else ("", 0)
+
+
+async def save_conversation_summary(user_id, summary, last_summarized_message_id, chat_id=None):
+    """
+    Апсерт вручную (SELECT -> UPDATE/INSERT), т.к. SQLite не дедуплицирует
+    строки через UNIQUE/ON CONFLICT когда chat_id IS NULL (личка).
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        if chat_id is not None:
+            cursor = await db.execute(
+                "SELECT id FROM conversation_summaries WHERE chat_id = ?",
+                (chat_id,),
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT id FROM conversation_summaries WHERE user_id = ? AND chat_id IS NULL",
+                (user_id,),
+            )
+        row = await cursor.fetchone()
+
+        if row:
+            await db.execute(
+                """
+                UPDATE conversation_summaries
+                SET summary = ?, last_summarized_message_id = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (summary, last_summarized_message_id, row[0]),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO conversation_summaries (user_id, chat_id, summary, last_summarized_message_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, chat_id, summary, last_summarized_message_id),
+            )
+
+        await db.commit()
+
+
+async def get_messages_after(user_id, after_message_id, chat_id=None):
+    """
+    Возвращает [(id, role, content), ...] для сообщений с id > after_message_id,
+    в хронологическом порядке (старые -> новые).
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        if chat_id is not None:
+            cursor = await db.execute(
+                """
+                SELECT id, role, content
+                FROM messages
+                WHERE chat_id = ? AND id > ?
+                ORDER BY id ASC
+                """,
+                (chat_id, after_message_id),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                SELECT id, role, content
+                FROM messages
+                WHERE user_id = ? AND chat_id IS NULL AND id > ?
+                ORDER BY id ASC
+                """,
+                (user_id, after_message_id),
+            )
+        return await cursor.fetchall()
 
 
 async def create_project(user_id, name, description=""):
