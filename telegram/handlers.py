@@ -3,8 +3,25 @@ import re
 
 from aiogram import Dispatcher, types
 
-from database.db import get_or_create_user, save_message, get_history, check_and_increment_limit, get_limit_status
-from router.ai_router import ask, ask_provider, get_provider_order, classify_request, generate_website_html, check_site_description
+from database.db import (
+    get_or_create_user,
+    save_message,
+    get_history,
+    check_and_increment_limit,
+    get_limit_status,
+    get_conversation_summary,
+    save_conversation_summary,
+    get_messages_after,
+)
+from router.ai_router import (
+    ask,
+    ask_provider,
+    get_provider_order,
+    classify_request,
+    generate_website_html,
+    check_site_description,
+    summarize_conversation,
+)
 from router.web_search import tavily_search, format_search_results
 from router.music import download_music
 import aiohttp
@@ -45,6 +62,64 @@ def needs_smart_classification(text: str) -> bool:
     return bool(FAST_CLASSIFY_PATTERN.search(text))
 
 PENDING_SITE_REQUESTS = {}
+
+# Через сколько новых сообщений после последней сумморизации запускать
+# обновление "скользящего" конспекта разговора.
+SUMMARY_TRIGGER_MESSAGE_COUNT = 14
+
+
+async def _maybe_update_conversation_summary(user_id, chat_id):
+    """
+    Фоновая задача: проверяет, накопилось ли достаточно новых сообщений
+    с момента последней сумморизации, и если да — обновляет конспект.
+    Не должна тормозить ответ пользователю, поэтому вызывается через
+    asyncio.create_task и сама ловит все свои ошибки.
+    """
+    try:
+        previous_summary, last_id = await get_conversation_summary(user_id, chat_id=chat_id)
+        new_messages = await get_messages_after(user_id, last_id, chat_id=chat_id)
+
+        if len(new_messages) < SUMMARY_TRIGGER_MESSAGE_COUNT:
+            return
+
+        role_labels = {"user": "Пользователь", "assistant": "Ассистент"}
+        lines = []
+        for _msg_id, role, content in new_messages:
+            label = role_labels.get(role, role)
+            lines.append(f"{label}: {content}")
+        new_messages_text = "\n".join(lines)
+
+        newest_message_id = new_messages[-1][0]
+
+        updated_summary = None
+        async with aiohttp.ClientSession() as session:
+            for provider in get_provider_order():
+                try:
+                    updated_summary = await summarize_conversation(
+                        session,
+                        provider,
+                        previous_summary,
+                        new_messages_text,
+                    )
+                    break
+                except Exception as e:
+                    print(f"[summarize_conversation] {provider} ERROR: {e}", flush=True)
+                    continue
+
+        if not updated_summary:
+            print("[Kasper] Summary update: all providers failed, skipping.", flush=True)
+            return
+
+        await save_conversation_summary(
+            user_id,
+            updated_summary,
+            newest_message_id,
+            chat_id=chat_id,
+        )
+        print(f"[Kasper] Summary updated for user_id={user_id} chat_id={chat_id}", flush=True)
+
+    except Exception as e:
+        print(f"[Kasper] Summary background task ERROR: {e}", flush=True)
 
 WELCOME_PROMPT = (
     "Ты — Kasper AI, ИИ-помощник в Telegram. Тебя только что добавили "
@@ -275,6 +350,21 @@ async def handle_message(message: types.Message):
             "content": KASPER_SYSTEM_PROMPT,
         }
     ]
+
+    conversation_summary, _last_summarized_id = await get_conversation_summary(user_id, chat_id=chat_id)
+    if conversation_summary:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Контекст из более ранней части разговора (используй его, "
+                    "чтобы понимать, о чём шла речь раньше, но отвечай строго "
+                    "на последнее сообщение пользователя):\n"
+                    f"{conversation_summary}"
+                ),
+            }
+        )
+
     for role, content in history:
         messages.append(
             {
@@ -468,6 +558,10 @@ async def handle_message(message: types.Message):
             "assistant",
             answer,
             chat_id=chat_id,
+        )
+
+        asyncio.create_task(
+            _maybe_update_conversation_summary(user_id, chat_id)
         )
 
         if animation_task:
