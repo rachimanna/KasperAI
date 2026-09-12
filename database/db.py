@@ -81,6 +81,34 @@ async def init_db():
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'lobby',
+                lobby_message_id INTEGER,
+                phase_ends_at TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS game_players (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                telegram_id INTEGER NOT NULL,
+                username TEXT,
+                role TEXT,
+                is_alive INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(game_id, user_id),
+                FOREIGN KEY (game_id) REFERENCES games(id),
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
         await db.commit()
 
 
@@ -428,3 +456,99 @@ async def check_and_increment_limit(user_id, daily_limit=20, telegram_id=None):
         )
         await db.commit()
         return True, daily_limit - count - 1
+
+
+async def create_game(chat_id):
+    """
+    Создаёт новую игру в статусе 'lobby' для чата.
+    Возвращает id созданной игры.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO games (chat_id, status) VALUES (?, 'lobby')",
+            (chat_id,),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def get_active_game(chat_id):
+    """
+    Возвращает (id, chat_id, status, lobby_message_id, phase_ends_at) для
+    незавершённой игры в чате, или None если такой нет.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT id, chat_id, status, lobby_message_id, phase_ends_at
+            FROM games
+            WHERE chat_id = ? AND status != 'finished'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        )
+        return await cursor.fetchone()
+
+
+async def set_game_lobby_message(game_id, message_id):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE games SET lobby_message_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (message_id, game_id),
+        )
+        await db.commit()
+
+
+async def set_game_status(game_id, status):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE games SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (status, game_id),
+        )
+        await db.commit()
+
+
+async def add_game_player(game_id, user_id, telegram_id, username=None):
+    """
+    Добавляет игрока в игру. Если он уже там — ничего не делает.
+    Возвращает True, если игрок был реально добавлен (не состоял раньше).
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            INSERT OR IGNORE INTO game_players (game_id, user_id, telegram_id, username)
+            VALUES (?, ?, ?, ?)
+            """,
+            (game_id, user_id, telegram_id, username),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def get_game_players(game_id):
+    """
+    Возвращает список (id, user_id, telegram_id, username, role, is_alive)
+    для всех игроков указанной игры.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT id, user_id, telegram_id, username, role, is_alive
+            FROM game_players
+            WHERE game_id = ?
+            ORDER BY id ASC
+            """,
+            (game_id,),
+        )
+        return await cursor.fetchall()
+
+
+async def is_player_in_game(game_id, user_id):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT id FROM game_players WHERE game_id = ? AND user_id = ?",
+            (game_id, user_id),
+        )
+        row = await cursor.fetchone()
+        return row is not None
