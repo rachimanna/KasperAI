@@ -122,8 +122,10 @@ async def start_game(bot, game_id, chat_id):
     try:
         await bot.send_message(
             chat_id,
-            "🌙 Наступила ночь. Тень выбирает жертву, Детектив ведёт "
-            f"расследование. Ждём {NIGHT_DURATION_SECONDS} секунд...",
+            "🌙 Наступила ночь. Город засыпает...\n"
+            "🕶 Тень вышла на охоту...\n"
+            "🔍 Детектив пошёл проверять...\n"
+            f"⏳ Ждём {NIGHT_DURATION_SECONDS} секунд...",
         )
     except Exception as e:
         print(f"[game] night announce ERROR: {e}", flush=True)
@@ -263,7 +265,12 @@ async def resolve_night(bot, game_id):
     if win_message:
         await set_game_phase(game_id, status="finished", phase_ends_at=None)
         try:
-            await bot.send_message(chat_id, f"{announce}\n\n{win_message}")
+            await bot.send_message(
+                chat_id,
+                f"{announce}\n\n🏁 Игра завершена!\n{win_message}"
+                f"{_role_reveal_text(players)}",
+                parse_mode="HTML",
+            )
         except Exception as e:
             print(f"[game] finish announce ERROR: {e}", flush=True)
         return
@@ -331,7 +338,13 @@ async def resolve_voting(bot, game_id):
     if win_message:
         await set_game_phase(game_id, status="finished", phase_ends_at=None)
         try:
-            await bot.send_message(chat_id, "\n".join(announce_lines) + f"\n\n{win_message}")
+            await bot.send_message(
+                chat_id,
+                "\n".join(announce_lines)
+                + f"\n\n🏁 Игра завершена!\n{win_message}"
+                + _role_reveal_text(players),
+                parse_mode="HTML",
+            )
         except Exception as e:
             print(f"[game] finish announce ERROR: {e}", flush=True)
         return
@@ -344,9 +357,17 @@ async def resolve_voting(bot, game_id):
         phase_number=next_phase_number,
     )
 
-    announce_lines.append(
-        f"\n🌙 Наступает следующая ночь. Ждём {NIGHT_DURATION_SECONDS} секунд..."
-    )
+    shadow_alive = any(p[4] == "shadow" for p in _alive_players(players))
+    detective_alive = any(p[4] == "detective" for p in _alive_players(players))
+
+    night_flavor = ["\n🌙 Наступает следующая ночь. Город засыпает..."]
+    if shadow_alive:
+        night_flavor.append("🕶 Тень вышла на охоту...")
+    if detective_alive:
+        night_flavor.append("🔍 Детектив пошёл проверять...")
+    night_flavor.append(f"⏳ Ждём {NIGHT_DURATION_SECONDS} секунд...")
+
+    announce_lines.append("\n".join(night_flavor))
     try:
         await bot.send_message(chat_id, "\n".join(announce_lines))
     except Exception as e:
@@ -359,6 +380,26 @@ async def resolve_voting(bot, game_id):
         await _send_night_action_keyboard(bot, game_id, next_phase_number, shadow_row, players, ACTION_KILL)
     if detective_row:
         await _send_night_action_keyboard(bot, game_id, next_phase_number, detective_row, players, ACTION_CHECK)
+
+
+def _role_reveal_text(players):
+    """
+    Формирует текст с раскрытием ролей всех участников — показывается
+    только когда игра уже завершена (после победы одной из сторон).
+    """
+    role_labels = {
+        "shadow": "🕶 Тень",
+        "detective": "🔍 Детектив",
+        "civilian": "👤 Мирный житель",
+    }
+    lines = ["\n📋 <b>Роли игроков:</b>"]
+    for p in players:
+        _pid, _user_id, telegram_id, username, role, is_alive = p
+        name = _display_name(username, telegram_id)
+        status = "" if is_alive else " (выбыл)"
+        label = role_labels.get(role, "❓ Неизвестно")
+        lines.append(f"• {name} — {label}{status}")
+    return "\n".join(lines)
 
 
 def _check_win_condition(players):
@@ -379,6 +420,11 @@ def _check_win_condition(players):
         return "🏆 Тень поглотила город — Тень победила!"
 
     return None
+
+
+def role_reveal_text(players):
+    """Публичная обёртка для использования из handlers.py (например /stopgame)."""
+    return _role_reveal_text(players)
 
 
 async def phase_checker_loop(bot):
