@@ -20,6 +20,12 @@ from database.db import (
     get_game_players,
     is_player_in_game,
 )
+from router.game_logic import (
+    start_game,
+    handle_night_action,
+    handle_vote_action,
+    phase_checker_loop,
+)
 from router.ai_router import (
     ask,
     ask_provider,
@@ -784,7 +790,72 @@ async def handle_game_start(callback_query: types.CallbackQuery):
         )
         return
 
-    await callback_query.answer("Игра скоро начнётся — раздача ролей в разработке 🚧", show_alert=True)
+    try:
+        await callback_query.message.edit_text(
+            "🎮 Игра началась! Роли разосланы в личные сообщения.",
+        )
+    except Exception:
+        pass
+
+    await callback_query.answer("Игра началась! Проверь личные сообщения от бота 📩", show_alert=True)
+
+    await start_game(callback_query.bot, game_id, chat_id)
+
+
+async def handle_game_night_action(callback_query: types.CallbackQuery):
+    # callback_data формата "game_night:{game_id}:{phase_number}:{action_type}:{target_user_id}"
+    _, game_id, phase_number, action_type, target_user_id = callback_query.data.split(":")
+    game_id = int(game_id)
+    phase_number = int(phase_number)
+    target_user_id = int(target_user_id)
+
+    telegram_user = callback_query.from_user
+    actor_user_id = await get_or_create_user(
+        telegram_id=telegram_user.id,
+        username=telegram_user.username,
+    )
+
+    # Кнопка приходит в личку боту, поэтому активную игру по chat.id тут
+    # не найти — просто сохраняем выбор. Если фаза уже завершилась к
+    # моменту нажатия, resolve_night() либо уже обработал game_actions
+    # этой фазы (тогда запись просто ни на что не повлияет), либо это
+    # действие для актуальной ночи — в любом случае безопасно.
+    await handle_night_action(game_id, phase_number, action_type, actor_user_id, target_user_id)
+
+    verb = "устранить" if action_type == "kill" else "проверить"
+    await callback_query.answer(f"Выбор сохранён ✅ ({verb})")
+
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+async def handle_game_vote_action(callback_query: types.CallbackQuery):
+    # callback_data формата "game_vote:{game_id}:{target_user_id}"
+    _, game_id, target_user_id = callback_query.data.split(":")
+    game_id = int(game_id)
+    target_user_id = int(target_user_id)
+
+    game = await get_active_game(callback_query.message.chat.id)
+    if not game or game[0] != game_id or game[2] != "voting":
+        await callback_query.answer("Голосование уже завершено.", show_alert=True)
+        return
+
+    phase_number = game[5]
+
+    telegram_user = callback_query.from_user
+    voter_user_id = await get_or_create_user(
+        telegram_id=telegram_user.id,
+        username=telegram_user.username,
+    )
+
+    if not await is_player_in_game(game_id, voter_user_id):
+        await callback_query.answer("Ты не участвуешь в этой игре.", show_alert=True)
+        return
+
+    await handle_vote_action(game_id, phase_number, voter_user_id, target_user_id)
+    await callback_query.answer("Голос учтён ✅")
 
 
 async def handle_game_stop(callback_query: types.CallbackQuery):
@@ -838,6 +909,14 @@ def register_handlers(dp: Dispatcher):
     dp.register_callback_query_handler(
         handle_game_stop,
         lambda c: c.data == "game_stop",
+    )
+    dp.register_callback_query_handler(
+        handle_game_night_action,
+        lambda c: c.data and c.data.startswith("game_night:"),
+    )
+    dp.register_callback_query_handler(
+        handle_game_vote_action,
+        lambda c: c.data and c.data.startswith("game_vote:"),
     )
     dp.register_message_handler(
         handle_new_chat_members,
