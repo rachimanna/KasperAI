@@ -1,15 +1,17 @@
 """
-Логика мини-игры "Теневой город" (этап 2): раздача ролей, ночная фаза,
-голосование, проверка условий победы, фоновый таймер фаз.
+Логика мини-игры "Теневой город" (этап 2-3): раздача ролей, ночная фаза,
+голосование, "последние слова" погибших, проверка условий победы,
+фоновый таймер фаз.
 
 Роли:
 - "shadow"    — Тень (ночью выбирает жертву)
 - "detective" — Детектив (ночью выбирает, кого проверить)
+- "doctor"    — Доктор (ночью выбирает, кого спасти от Тени, можно себя)
 - "civilian"  — мирный житель
 
 Фазы игры (поле games.status):
 - "lobby"    — сбор игроков (этап 1, уже реализован в handlers.py)
-- "night"    — Тень выбирает жертву, Детектив выбирает, кого проверить
+- "night"    — Тень выбирает жертву, Детектив проверяет, Доктор лечит
 - "voting"   — открытое голосование в группе за исключение подозреваемого
 - "finished" — игра завершена
 
@@ -19,6 +21,13 @@ free-инстанса Render. Фоновая задача phase_checker_loop() �
 секунд спрашивает у БД, у каких игр истекло время фазы, и продвигает их
 дальше. Она безопасна к перезапуску: если бот перезапустится посреди
 цикла, при следующем старте она просто продолжит проверять games.
+
+"Последние слова": когда игрок погибает (ночью от Тени или днём по
+голосованию), ему в личку даётся немного времени написать прощальное
+сообщение, которое потом публикуется в группе вместе с объявлением о
+смерти. Захват текста происходит через PENDING_LAST_WORDS — общий
+словарь {telegram_id: {"text": None|str}}, в который handlers.py кладёт
+текст, если у пользователя в личке ожидается "последнее слово".
 """
 
 import asyncio
@@ -40,13 +49,20 @@ from database.db import (
 NIGHT_DURATION_SECONDS = 60
 VOTING_DURATION_SECONDS = 60
 PHASE_CHECK_INTERVAL_SECONDS = 7
+LAST_WORDS_WINDOW_SECONDS = 20
 
 # action_type в таблице game_actions
 ACTION_KILL = "kill"
 ACTION_CHECK = "check"
+ACTION_HEAL = "heal"
 ACTION_VOTE = "vote"
 
 SKIP_TARGET_ID = 0  # условный "пропустить голос"
+
+# {telegram_id: {"text": str|None}} — пока пользователь в этом словаре,
+# handlers.py перехватывает его следующее личное текстовое сообщение как
+# "последние слова" вместо обычного AI-чата.
+PENDING_LAST_WORDS = {}
 
 
 def _now_iso():
@@ -70,6 +86,42 @@ def _by_role(players, role):
     return [p for p in _alive_players(players) if p[4] == role]
 
 
+def capture_last_words(telegram_id, text):
+    """
+    Вызывается из handlers.py, когда в личку боту приходит текстовое
+    сообщение от пользователя, ожидающего отправки последних слов.
+    Возвращает True, если сообщение было перехвачено как последние слова
+    (тогда handlers.py не должен передавать текст дальше в AI-чат).
+    """
+    if telegram_id in PENDING_LAST_WORDS:
+        PENDING_LAST_WORDS[telegram_id]["text"] = text
+        return True
+    return False
+
+
+async def _await_last_words(bot, telegram_id):
+    """
+    Просит игрока написать последние слова и ждёт LAST_WORDS_WINDOW_SECONDS
+    секунд. Возвращает текст, если игрок успел ответить, иначе None.
+    """
+    PENDING_LAST_WORDS[telegram_id] = {"text": None}
+    try:
+        await bot.send_message(
+            telegram_id,
+            "💀 Ты выбыл(а) из игры.\n"
+            f"У тебя есть {LAST_WORDS_WINDOW_SECONDS} секунд, чтобы написать "
+            "последние слова — просто ответь сюда текстом. Их увидят в группе.",
+        )
+    except Exception as e:
+        print(f"[game] last words prompt ERROR: {e}", flush=True)
+        PENDING_LAST_WORDS.pop(telegram_id, None)
+        return None
+
+    await asyncio.sleep(LAST_WORDS_WINDOW_SECONDS)
+    entry = PENDING_LAST_WORDS.pop(telegram_id, None)
+    return entry["text"] if entry else None
+
+
 async def start_game(bot, game_id, chat_id):
     """
     Раздаёт роли, переводит игру в ночную фазу №1 и рассылает роли в личку.
@@ -77,9 +129,13 @@ async def start_game(bot, game_id, chat_id):
     """
     players = await get_game_players(game_id)
 
-    shadow, detective, civilians = _pick_roles(players)
+    shadow, detective, doctor, civilians = _pick_roles(players)
 
-    role_by_user_id = {shadow[1]: "shadow", detective[1]: "detective"}
+    role_by_user_id = {
+        shadow[1]: "shadow",
+        detective[1]: "detective",
+        doctor[1]: "doctor",
+    }
     for c in civilians:
         role_by_user_id[c[1]] = "civilian"
 
@@ -97,6 +153,11 @@ async def start_game(bot, game_id, chat_id):
             "🔍 Ты — <b>Детектив</b>.\n"
             "Каждую ночь можешь проверить одного игрока и узнать, Тень он "
             "или нет. Помоги мирным вычислить Тень."
+        ),
+        "doctor": (
+            "💊 Ты — <b>Доктор</b>.\n"
+            "Каждую ночь можешь спасти одного игрока (в том числе себя) "
+            "от Тени. Если угадаешь, кого выберет Тень — жертва выживет."
         ),
         "civilian": (
             "👤 Ты — <b>мирный житель</b>.\n"
@@ -125,20 +186,24 @@ async def start_game(bot, game_id, chat_id):
             "🌙 Наступила ночь. Город засыпает...\n"
             "🕶 Тень вышла на охоту...\n"
             "🔍 Детектив пошёл проверять...\n"
+            "💊 Доктор готовится спасать...\n"
             f"⏳ Ждём {NIGHT_DURATION_SECONDS} секунд...",
         )
     except Exception as e:
         print(f"[game] night announce ERROR: {e}", flush=True)
 
-    # Отправить кнопки выбора действия Тени и Детективу.
+    # Отправить кнопки выбора действия Тени, Детективу и Доктору.
     updated_players = await get_game_players(game_id)
     shadow_row = next((p for p in updated_players if p[1] == shadow[1]), None)
     detective_row = next((p for p in updated_players if p[1] == detective[1]), None)
+    doctor_row = next((p for p in updated_players if p[1] == doctor[1]), None)
 
     if shadow_row:
         await _send_night_action_keyboard(bot, game_id, 1, shadow_row, updated_players, ACTION_KILL)
     if detective_row:
         await _send_night_action_keyboard(bot, game_id, 1, detective_row, updated_players, ACTION_CHECK)
+    if doctor_row:
+        await _send_night_action_keyboard(bot, game_id, 1, doctor_row, updated_players, ACTION_HEAL, allow_self=True)
 
 
 def _pick_roles(players):
@@ -146,27 +211,41 @@ def _pick_roles(players):
     random.shuffle(pool)
     shadow = pool[0]
     detective = pool[1]
-    civilians = pool[2:]
-    return shadow, detective, civilians
+    doctor = pool[2]
+    civilians = pool[3:]
+    return shadow, detective, doctor, civilians
 
 
-async def _send_night_action_keyboard(bot, game_id, phase_number, actor_row, players, action_type):
+ACTION_VERBS = {
+    ACTION_KILL: "устранить",
+    ACTION_CHECK: "проверить",
+    ACTION_HEAL: "спасти",
+}
+
+
+async def _send_night_action_keyboard(bot, game_id, phase_number, actor_row, players, action_type, allow_self=False):
     from aiogram import types
 
     _pid, actor_user_id, actor_telegram_id, _uname, _role, _alive = actor_row
 
-    targets = [p for p in _alive_players(players) if p[1] != actor_user_id]
+    targets = [
+        p for p in _alive_players(players)
+        if allow_self or p[1] != actor_user_id
+    ]
 
     if not targets:
         return
 
-    verb = "устранить" if action_type == ACTION_KILL else "проверить"
+    verb = ACTION_VERBS.get(action_type, "выбрать")
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     for t in targets:
         _tpid, target_user_id, target_telegram_id, target_username, _trole, _talive = t
+        label = _display_name(target_username, target_telegram_id)
+        if allow_self and target_user_id == actor_user_id:
+            label += " (себя)"
         keyboard.add(
             types.InlineKeyboardButton(
-                text=_display_name(target_username, target_telegram_id),
+                text=label,
                 callback_data=f"game_night:{game_id}:{phase_number}:{action_type}:{target_user_id}",
             )
         )
@@ -215,10 +294,38 @@ async def handle_vote_action(game_id, phase_number, actor_user_id, target_user_i
     await save_game_action(game_id, phase_number, actor_user_id, ACTION_VOTE, target_user_id)
 
 
+async def _send_voting_message(bot, chat_id, game_id, players, text):
+    keyboard = await _build_voting_keyboard(game_id, players)
+    try:
+        await bot.send_message(
+            chat_id,
+            f"{text}\n\n🗳 Голосуйте, кого подозреваете в роли Тени "
+            f"({VOTING_DURATION_SECONDS} секунд):",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        print(f"[game] voting announce ERROR: {e}", flush=True)
+
+
+async def _finalize_night_announcement(bot, chat_id, game_id, victim_row, base_announce, players):
+    """
+    Ждёт последние слова погибшего (в фоне, не блокируя фоновый таймер
+    других игр), затем публикует итог ночи и открывает голосование.
+    """
+    last_words = await _await_last_words(bot, victim_row[2])
+    text = base_announce
+    if last_words:
+        name = _display_name(victim_row[3], victim_row[2])
+        text += f"\n\n💬 Последние слова {name}:\n«{last_words}»"
+
+    await _send_voting_message(bot, chat_id, game_id, players, text)
+
+
 async def resolve_night(bot, game_id):
     """
-    Подводит итоги ночи: убивает жертву Тени, шлёт Детективу результат
-    проверки в личку, объявляет итог в группе (без раскрытия ролей) и
+    Подводит итоги ночи: убивает жертву Тени (если Доктор её не спас),
+    шлёт Детективу результат проверки в личку, объявляет итог в группе
+    (без раскрытия ролей, с возможностью последних слов погибшего) и
     запускает голосование.
     """
     game = await get_game_by_id(game_id)
@@ -230,12 +337,17 @@ async def resolve_night(bot, game_id):
 
     kill_actions = await get_actions_by_type(game_id, phase_number, ACTION_KILL)
     check_actions = await get_actions_by_type(game_id, phase_number, ACTION_CHECK)
+    heal_actions = await get_actions_by_type(game_id, phase_number, ACTION_HEAL)
 
     victim_user_id = kill_actions[0][1] if kill_actions else None
-    victim_row = next((p for p in players if p[1] == victim_user_id), None) if victim_user_id else None
+    healed_user_id = heal_actions[0][1] if heal_actions else None
+    saved_by_doctor = victim_user_id is not None and victim_user_id == healed_user_id
 
-    if victim_row:
-        await set_player_alive(game_id, victim_user_id, False)
+    victim_row = None
+    if victim_user_id and not saved_by_doctor:
+        victim_row = next((p for p in players if p[1] == victim_user_id), None)
+        if victim_row:
+            await set_player_alive(game_id, victim_user_id, False)
 
     if check_actions:
         detective_user_id, checked_user_id = check_actions[0]
@@ -255,7 +367,9 @@ async def resolve_night(bot, game_id):
 
     players = await get_game_players(game_id)  # обновить is_alive
 
-    if victim_row:
+    if saved_by_doctor:
+        announce = "💊 Этой ночью Доктор спас жертву Тени! Никто не погиб."
+    elif victim_row:
         victim_name = _display_name(victim_row[3], victim_row[2])
         announce = f"☠️ Этой ночью погиб(ла) {victim_name}."
     else:
@@ -275,30 +389,75 @@ async def resolve_night(bot, game_id):
             print(f"[game] finish announce ERROR: {e}", flush=True)
         return
 
-    next_phase_number = phase_number  # голосование делит тот же номер фазы, не увеличиваем
+    # Если есть настоящая жертва — даём ей немного времени на последние
+    # слова в фоне, не блокируя проверку остальных игр таймером.
+    extra_delay = LAST_WORDS_WINDOW_SECONDS if victim_row else 0
     await set_game_phase(
         game_id,
         status="voting",
-        phase_ends_at=_future_iso(VOTING_DURATION_SECONDS),
+        phase_ends_at=_future_iso(extra_delay + VOTING_DURATION_SECONDS),
     )
 
-    keyboard = await _build_voting_keyboard(game_id, players)
-    try:
-        await bot.send_message(
-            chat_id,
-            f"{announce}\n\n🗳 Голосуйте, кого подозреваете в роли Тени "
-            f"({VOTING_DURATION_SECONDS} секунд):",
-            reply_markup=keyboard,
+    if victim_row:
+        asyncio.create_task(
+            _finalize_night_announcement(bot, chat_id, game_id, victim_row, announce, players)
         )
+    else:
+        await _send_voting_message(bot, chat_id, game_id, players, announce)
+
+
+async def _finalize_voting_announcement(bot, chat_id, game_id, excluded_row, base_lines, players, next_phase_number):
+    """
+    Ждёт последние слова исключённого голосованием игрока, публикует итог
+    и открывает следующую ночь.
+    """
+    last_words = await _await_last_words(bot, excluded_row[2])
+    lines = list(base_lines)
+    if last_words:
+        name = _display_name(excluded_row[3], excluded_row[2])
+        lines.append(f"\n💬 Последние слова {name}:\n«{last_words}»")
+
+    await _announce_next_night(bot, chat_id, game_id, players, lines, next_phase_number)
+
+
+async def _announce_next_night(bot, chat_id, game_id, players, announce_lines, next_phase_number):
+    shadow_alive = any(p[4] == "shadow" for p in _alive_players(players))
+    detective_alive = any(p[4] == "detective" for p in _alive_players(players))
+    doctor_alive = any(p[4] == "doctor" for p in _alive_players(players))
+
+    night_flavor = ["\n🌙 Наступает следующая ночь. Город засыпает..."]
+    if shadow_alive:
+        night_flavor.append("🕶 Тень вышла на охоту...")
+    if detective_alive:
+        night_flavor.append("🔍 Детектив пошёл проверять...")
+    if doctor_alive:
+        night_flavor.append("💊 Доктор готовится спасать...")
+    night_flavor.append(f"⏳ Ждём {NIGHT_DURATION_SECONDS} секунд...")
+
+    announce_lines = announce_lines + ["\n".join(night_flavor)]
+    try:
+        await bot.send_message(chat_id, "\n".join(announce_lines))
     except Exception as e:
-        print(f"[game] voting announce ERROR: {e}", flush=True)
+        print(f"[game] next night announce ERROR: {e}", flush=True)
+
+    shadow_row = next((p for p in _alive_players(players) if p[4] == "shadow"), None)
+    detective_row = next((p for p in _alive_players(players) if p[4] == "detective"), None)
+    doctor_row = next((p for p in _alive_players(players) if p[4] == "doctor"), None)
+
+    if shadow_row:
+        await _send_night_action_keyboard(bot, game_id, next_phase_number, shadow_row, players, ACTION_KILL)
+    if detective_row:
+        await _send_night_action_keyboard(bot, game_id, next_phase_number, detective_row, players, ACTION_CHECK)
+    if doctor_row:
+        await _send_night_action_keyboard(bot, game_id, next_phase_number, doctor_row, players, ACTION_HEAL, allow_self=True)
 
 
 async def resolve_voting(bot, game_id):
     """
     Подводит итоги голосования: исключает игрока с наибольшим числом
     голосов (при равенстве — никто не исключается), проверяет условия
-    победы, либо запускает следующую ночь.
+    победы, либо запускает следующую ночь (с последними словами
+    исключённого, если он есть).
     """
     game = await get_game_by_id(game_id)
     if not game or game[2] != "voting":
@@ -315,6 +474,7 @@ async def resolve_voting(bot, game_id):
         tally[target_user_id] = tally.get(target_user_id, 0) + 1
 
     announce_lines = []
+    excluded_row = None
 
     if tally:
         max_votes = max(tally.values())
@@ -350,36 +510,20 @@ async def resolve_voting(bot, game_id):
         return
 
     next_phase_number = phase_number + 1
+    extra_delay = LAST_WORDS_WINDOW_SECONDS if excluded_row else 0
     await set_game_phase(
         game_id,
         status="night",
-        phase_ends_at=_future_iso(NIGHT_DURATION_SECONDS),
+        phase_ends_at=_future_iso(extra_delay + NIGHT_DURATION_SECONDS),
         phase_number=next_phase_number,
     )
 
-    shadow_alive = any(p[4] == "shadow" for p in _alive_players(players))
-    detective_alive = any(p[4] == "detective" for p in _alive_players(players))
-
-    night_flavor = ["\n🌙 Наступает следующая ночь. Город засыпает..."]
-    if shadow_alive:
-        night_flavor.append("🕶 Тень вышла на охоту...")
-    if detective_alive:
-        night_flavor.append("🔍 Детектив пошёл проверять...")
-    night_flavor.append(f"⏳ Ждём {NIGHT_DURATION_SECONDS} секунд...")
-
-    announce_lines.append("\n".join(night_flavor))
-    try:
-        await bot.send_message(chat_id, "\n".join(announce_lines))
-    except Exception as e:
-        print(f"[game] next night announce ERROR: {e}", flush=True)
-
-    shadow_row = next((p for p in _alive_players(players) if p[4] == "shadow"), None)
-    detective_row = next((p for p in _alive_players(players) if p[4] == "detective"), None)
-
-    if shadow_row:
-        await _send_night_action_keyboard(bot, game_id, next_phase_number, shadow_row, players, ACTION_KILL)
-    if detective_row:
-        await _send_night_action_keyboard(bot, game_id, next_phase_number, detective_row, players, ACTION_CHECK)
+    if excluded_row:
+        asyncio.create_task(
+            _finalize_voting_announcement(bot, chat_id, game_id, excluded_row, announce_lines, players, next_phase_number)
+        )
+    else:
+        await _announce_next_night(bot, chat_id, game_id, players, announce_lines, next_phase_number)
 
 
 def _role_reveal_text(players):
@@ -390,6 +534,7 @@ def _role_reveal_text(players):
     role_labels = {
         "shadow": "🕶 Тень",
         "detective": "🔍 Детектив",
+        "doctor": "💊 Доктор",
         "civilian": "👤 Мирный житель",
     }
     lines = ["\n📋 <b>Роли игроков:</b>"]
@@ -406,8 +551,7 @@ def _check_win_condition(players):
     """
     Возвращает текст объявления победителя, если игра окончена, иначе None.
     - Тень мертва -> мирные победили.
-    - Тень жива и её число >= числа мирных живых (детектив тоже мирный
-      по числу голосов, но исход считаем по "не-Тень" живым) -> Тень победила.
+    - Тень жива и её число >= числа остальных живых -> Тень победила.
     """
     alive = _alive_players(players)
     shadow_alive = [p for p in alive if p[4] == "shadow"]
