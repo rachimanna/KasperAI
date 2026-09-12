@@ -1,3 +1,4 @@
+
 import os
 from dotenv import load_dotenv
 
@@ -19,3 +20,13 @@ AI_PROVIDERS = [
 ]
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "data/kasper.db")
+
+# Telegram ID администраторов бота. Поддерживаются оба варианта:
+# ADMIN_ID=123456789 (один айди, уже мог быть задан на Render)
+# ADMIN_IDS=123456789,987654321 (несколько через запятую)
+_admin_ids_raw = os.getenv("ADMIN_IDS", "") + "," + os.getenv("ADMIN_ID", "")
+ADMIN_IDS = [
+    int(x.strip())
+    for x in _admin_ids_raw.split(",")
+    if x.strip().isdigit()
+]
