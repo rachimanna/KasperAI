@@ -12,6 +12,13 @@ from database.db import (
     get_conversation_summary,
     save_conversation_summary,
     get_messages_after,
+    create_game,
+    get_active_game,
+    set_game_lobby_message,
+    set_game_status,
+    add_game_player,
+    get_game_players,
+    is_player_in_game,
 )
 from router.ai_router import (
     ask,
@@ -623,6 +630,182 @@ async def handle_message(message: types.Message):
 
 
 
+MIN_GAME_PLAYERS = 4
+
+
+def _build_lobby_keyboard(bot_username, players_count, max_players=10):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🚀 Присоединиться",
+            callback_data="game_join",
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="🎮 Начать игру",
+            callback_data="game_start",
+        ),
+        types.InlineKeyboardButton(
+            text="🛑 Остановить",
+            callback_data="game_stop",
+        ),
+    )
+    return keyboard
+
+
+def _build_lobby_text(players, max_players=10):
+    lines = [
+        "🎮 <b>ТЕНЕВОЙ ГОРОД</b>",
+        "Мини-игра для группы.",
+        "",
+        f"👥 Игроков: {len(players)}/{max_players}",
+    ]
+    if players:
+        lines.append("")
+        for _pid, _uid, _tgid, username, _role, _alive in players:
+            display_name = f"@{username}" if username else f"id{_tgid}"
+            lines.append(f"• {display_name}")
+    lines.append("")
+    lines.append("Нажми «Присоединиться», чтобы принять участие.")
+    return "\n".join(lines)
+
+
+async def cmd_game(message: types.Message):
+    if message.chat.type not in ("group", "supergroup"):
+        await message.answer("🎮 Игра доступна только в групповых чатах.")
+        return
+
+    chat_id = message.chat.id
+
+    existing_game = await get_active_game(chat_id)
+    if existing_game:
+        await message.answer("⚠️ В этом чате уже идёт игра. Дождитесь её окончания или остановите через кнопку.")
+        return
+
+    game_id = await create_game(chat_id)
+
+    keyboard = _build_lobby_keyboard(None, 0)
+    text = _build_lobby_text([])
+
+    sent = await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    await set_game_lobby_message(game_id, sent.message_id)
+
+
+async def cmd_stopgame(message: types.Message):
+    if message.chat.type not in ("group", "supergroup"):
+        return
+
+    chat_id = message.chat.id
+    existing_game = await get_active_game(chat_id)
+
+    if not existing_game:
+        await message.answer("Сейчас в этом чате нет активной игры.")
+        return
+
+    game_id = existing_game[0]
+    await set_game_status(game_id, "finished")
+    await message.answer("🛑 Игра остановлена.")
+
+
+async def handle_game_join(callback_query: types.CallbackQuery):
+    chat_id = callback_query.message.chat.id
+    game = await get_active_game(chat_id)
+
+    if not game or game[2] != "lobby":
+        await callback_query.answer("Сейчас нельзя присоединиться — игра уже началась или её нет.", show_alert=True)
+        return
+
+    game_id = game[0]
+    telegram_user = callback_query.from_user
+
+    user_id = await get_or_create_user(
+        telegram_id=telegram_user.id,
+        username=telegram_user.username,
+    )
+
+    already_in = await is_player_in_game(game_id, user_id)
+    if already_in:
+        await callback_query.answer("Ты уже в игре ✅")
+        return
+
+    # Проверяем, может ли бот написать игроку в личку — без этого он не
+    # сможет получить свою роль. Если ещё ни разу не писал боту — просим
+    # сначала нажать /start в личке.
+    try:
+        await callback_query.bot.send_chat_action(telegram_user.id, "typing")
+    except Exception:
+        bot_info = await callback_query.bot.get_me()
+        await callback_query.answer(
+            f"Сначала напиши мне в личку @{bot_info.username} и нажми /start, "
+            "потом возвращайся и жми «Присоединиться» ещё раз.",
+            show_alert=True,
+        )
+        return
+
+    added = await add_game_player(
+        game_id,
+        user_id,
+        telegram_user.id,
+        username=telegram_user.username,
+    )
+
+    if not added:
+        await callback_query.answer("Ты уже в игре ✅")
+        return
+
+    players = await get_game_players(game_id)
+    keyboard = _build_lobby_keyboard(None, len(players))
+    text = _build_lobby_text(players)
+
+    try:
+        await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception as e:
+        print(f"[game] lobby edit ERROR: {e}", flush=True)
+
+    await callback_query.answer("Ты в игре! 🎮")
+
+
+async def handle_game_start(callback_query: types.CallbackQuery):
+    chat_id = callback_query.message.chat.id
+    game = await get_active_game(chat_id)
+
+    if not game or game[2] != "lobby":
+        await callback_query.answer("Игру уже нельзя начать сейчас.", show_alert=True)
+        return
+
+    game_id = game[0]
+    players = await get_game_players(game_id)
+
+    if len(players) < MIN_GAME_PLAYERS:
+        await callback_query.answer(
+            f"Нужно минимум {MIN_GAME_PLAYERS} игрока, сейчас {len(players)}.",
+            show_alert=True,
+        )
+        return
+
+    await callback_query.answer("Игра скоро начнётся — раздача ролей в разработке 🚧", show_alert=True)
+
+
+async def handle_game_stop(callback_query: types.CallbackQuery):
+    chat_id = callback_query.message.chat.id
+    game = await get_active_game(chat_id)
+
+    if not game:
+        await callback_query.answer("Игра уже завершена.", show_alert=True)
+        return
+
+    game_id = game[0]
+    await set_game_status(game_id, "finished")
+
+    try:
+        await callback_query.message.edit_text("🛑 Игра остановлена.")
+    except Exception:
+        pass
+
+    await callback_query.answer("Игра остановлена.")
+
+
 def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         cmd_start,
@@ -635,6 +818,26 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         cmd_limit,
         commands=["limit"],
+    )
+    dp.register_message_handler(
+        cmd_game,
+        commands=["game"],
+    )
+    dp.register_message_handler(
+        cmd_stopgame,
+        commands=["stopgame"],
+    )
+    dp.register_callback_query_handler(
+        handle_game_join,
+        lambda c: c.data == "game_join",
+    )
+    dp.register_callback_query_handler(
+        handle_game_start,
+        lambda c: c.data == "game_start",
+    )
+    dp.register_callback_query_handler(
+        handle_game_stop,
+        lambda c: c.data == "game_stop",
     )
     dp.register_message_handler(
         handle_new_chat_members,
