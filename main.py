@@ -1,3 +1,4 @@
+
 import asyncio
 import logging
 import os
@@ -47,6 +48,8 @@ async def on_startup(dp):
     await dp.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
+        BotCommand("game", "Начать игру «Теневой город»"),
+        BotCommand("stopgame", "Остановить текущую игру"),
     ])
 
     # Фоновая задача мини-игры "Теневой город": раз в несколько секунд
