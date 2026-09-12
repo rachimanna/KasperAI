@@ -109,6 +109,29 @@ async def init_db():
             )
         """)
 
+        # Миграция: номер фазы (0 = лобби, 1 = первая ночь, ...).
+        # CREATE TABLE IF NOT EXISTS не добавляет колонки в уже существующую
+        # таблицу games, поэтому добавляем через ALTER TABLE и глушим ошибку,
+        # если колонка уже была добавлена раньше.
+        try:
+            await db.execute("ALTER TABLE games ADD COLUMN phase_number INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS game_actions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                game_id INTEGER NOT NULL,
+                phase_number INTEGER NOT NULL,
+                actor_user_id INTEGER NOT NULL,
+                action_type TEXT NOT NULL,
+                target_user_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(game_id, phase_number, actor_user_id),
+                FOREIGN KEY (game_id) REFERENCES games(id)
+            )
+        """)
+
         await db.commit()
 
 
@@ -474,13 +497,13 @@ async def create_game(chat_id):
 
 async def get_active_game(chat_id):
     """
-    Возвращает (id, chat_id, status, lobby_message_id, phase_ends_at) для
-    незавершённой игры в чате, или None если такой нет.
+    Возвращает (id, chat_id, status, lobby_message_id, phase_ends_at,
+    phase_number) для незавершённой игры в чате, или None если такой нет.
     """
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cursor = await db.execute(
             """
-            SELECT id, chat_id, status, lobby_message_id, phase_ends_at
+            SELECT id, chat_id, status, lobby_message_id, phase_ends_at, phase_number
             FROM games
             WHERE chat_id = ? AND status != 'finished'
             ORDER BY id DESC
@@ -489,6 +512,45 @@ async def get_active_game(chat_id):
             (chat_id,),
         )
         return await cursor.fetchone()
+
+
+async def get_game_by_id(game_id):
+    """
+    То же самое, что get_active_game, но по id игры (не важно, завершена
+    она или нет). Используется фоновым проверятелем таймеров.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT id, chat_id, status, lobby_message_id, phase_ends_at, phase_number
+            FROM games
+            WHERE id = ?
+            """,
+            (game_id,),
+        )
+        return await cursor.fetchone()
+
+
+async def get_games_with_expired_phase(now_iso):
+    """
+    Возвращает id всех игр в статусе 'night' или 'voting', у которых
+    phase_ends_at уже наступил (<= now_iso, время в UTC ISO-строке).
+    Используется фоновой задачей, которая переживает перезапуск бота,
+    т.к. ничего не хранится в памяти процесса — только в БД.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT id
+            FROM games
+            WHERE status IN ('night', 'voting')
+              AND phase_ends_at IS NOT NULL
+              AND phase_ends_at <= ?
+            """,
+            (now_iso,),
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
 
 
 async def set_game_lobby_message(game_id, message_id):
@@ -552,3 +614,100 @@ async def is_player_in_game(game_id, user_id):
         )
         row = await cursor.fetchone()
         return row is not None
+
+
+async def set_game_phase(game_id, status, phase_ends_at, phase_number=None):
+    """
+    Переводит игру в новую фазу (night / voting / finished и т.д.) и
+    записывает время окончания фазы в БД (используется фоновым таймером,
+    который переживает перезапуск/пересыпание бота на Render).
+    Если phase_number передан — обновляет и его (иначе оставляет как есть).
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        if phase_number is None:
+            await db.execute(
+                """
+                UPDATE games
+                SET status = ?, phase_ends_at = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, phase_ends_at, game_id),
+            )
+        else:
+            await db.execute(
+                """
+                UPDATE games
+                SET status = ?, phase_ends_at = ?, phase_number = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (status, phase_ends_at, phase_number, game_id),
+            )
+        await db.commit()
+
+
+async def assign_game_roles(game_id, role_by_user_id):
+    """
+    role_by_user_id: словарь {user_id: role} ('shadow' / 'detective' / 'civilian').
+    Раздаёт роли всем игрокам игры за один заход.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        for user_id, role in role_by_user_id.items():
+            await db.execute(
+                "UPDATE game_players SET role = ? WHERE game_id = ? AND user_id = ?",
+                (role, game_id, user_id),
+            )
+        await db.commit()
+
+
+async def set_player_alive(game_id, user_id, is_alive):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE game_players SET is_alive = ? WHERE game_id = ? AND user_id = ?",
+            (1 if is_alive else 0, game_id, user_id),
+        )
+        await db.commit()
+
+
+async def save_game_action(game_id, phase_number, actor_user_id, action_type, target_user_id):
+    """
+    Сохраняет выбор игрока за фазу (ночное действие Тени/Детектива или
+    дневной голос). Если игрок передумал и жмёт другую кнопку в той же
+    фазе — выбор просто перезаписывается (INSERT OR REPLACE).
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO game_actions
+                (game_id, phase_number, actor_user_id, action_type, target_user_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (game_id, phase_number, actor_user_id, action_type, target_user_id),
+        )
+        await db.commit()
+
+
+async def get_game_action(game_id, phase_number, actor_user_id):
+    """Возвращает target_user_id выбора игрока в этой фазе, или None."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT target_user_id FROM game_actions
+            WHERE game_id = ? AND phase_number = ? AND actor_user_id = ?
+            """,
+            (game_id, phase_number, actor_user_id),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def get_actions_by_type(game_id, phase_number, action_type):
+    """Возвращает список (actor_user_id, target_user_id) для этой фазы/типа."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT actor_user_id, target_user_id FROM game_actions
+            WHERE game_id = ? AND phase_number = ? AND action_type = ?
+            """,
+            (game_id, phase_number, action_type),
+        )
+        return await cursor.fetchall()
