@@ -19,7 +19,14 @@ from database.db import (
     add_game_player,
     get_game_players,
     is_player_in_game,
+    set_user_banned,
+    is_user_banned,
+    find_telegram_id_by_username,
+    get_all_telegram_ids,
 )
+from config.settings import ADMIN_IDS
+from aiogram.dispatcher.middlewares import BaseMiddleware
+from aiogram.dispatcher.handler import CancelHandler
 from router.game_logic import (
     start_game,
     handle_night_action,
@@ -907,7 +914,132 @@ async def handle_game_stop(callback_query: types.CallbackQuery):
     await callback_query.answer("Игра остановлена.")
 
 
+class BanCheckMiddleware(BaseMiddleware):
+    """
+    Блокирует обработку сообщений и нажатий кнопок от забаненных
+    пользователей — просто тихо отменяет дальнейшую обработку апдейта.
+    """
+
+    async def on_process_message(self, message: types.Message, data: dict):
+        if await is_user_banned(message.from_user.id):
+            raise CancelHandler()
+
+    async def on_process_callback_query(self, callback_query: types.CallbackQuery, data: dict):
+        if await is_user_banned(callback_query.from_user.id):
+            raise CancelHandler()
+
+
+async def _resolve_target_telegram_id(message: types.Message):
+    """
+    Определяет telegram_id пользователя-цели для /ban и /unban:
+    - если команда отправлена ответом на чьё-то сообщение — берёт автора;
+    - иначе разбирает аргумент команды: @username или числовой telegram_id.
+    """
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+
+    arg = parts[1].strip()
+    if arg.startswith("@"):
+        return await find_telegram_id_by_username(arg)
+    if arg.lstrip("-").isdigit():
+        return int(arg)
+    return None
+
+
+async def cmd_ban(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    target_id = await _resolve_target_telegram_id(message)
+    if not target_id:
+        await message.answer(
+            "Использование: <code>/ban telegram_id</code> или <code>/ban @username</code>, "
+            "либо отправь /ban ответом на сообщение нужного пользователя.",
+            parse_mode="HTML",
+        )
+        return
+
+    await set_user_banned(target_id, True)
+    await message.answer(f"🚫 Пользователь <code>{target_id}</code> забанен.", parse_mode="HTML")
+
+
+async def cmd_unban(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    target_id = await _resolve_target_telegram_id(message)
+    if not target_id:
+        await message.answer(
+            "Использование: <code>/unban telegram_id</code> или <code>/unban @username</code>, "
+            "либо отправь /unban ответом на сообщение нужного пользователя.",
+            parse_mode="HTML",
+        )
+        return
+
+    await set_user_banned(target_id, False)
+    await message.answer(f"✅ Пользователь <code>{target_id}</code> разбанен.", parse_mode="HTML")
+
+
+async def cmd_broadcast(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    photo_file_id = None
+    text = None
+
+    if message.reply_to_message:
+        # Рассылаем то сообщение, на которое ответили командой /broadcast —
+        # так можно разослать и фото с подписью, и обычный текст.
+        src = message.reply_to_message
+        if src.photo:
+            photo_file_id = src.photo[-1].file_id
+            text = src.caption or ""
+        else:
+            text = src.text or src.caption or ""
+    else:
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            await message.answer(
+                "Использование: <code>/broadcast текст</code>, либо отправь /broadcast "
+                "ответом на сообщение (текст или фото с подписью), которое нужно разослать.",
+                parse_mode="HTML",
+            )
+            return
+        text = parts[1]
+
+    telegram_ids = await get_all_telegram_ids()
+    status_message = await message.answer(
+        f"📤 Рассылка начата, получателей: {len(telegram_ids)}..."
+    )
+
+    sent = 0
+    failed = 0
+    for telegram_id in telegram_ids:
+        try:
+            if photo_file_id:
+                await message.bot.send_photo(telegram_id, photo_file_id, caption=text or None)
+            else:
+                await message.bot.send_message(telegram_id, text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # пауза, чтобы не упереться в лимиты Telegram
+
+    try:
+        await status_message.edit_text(
+            f"✅ Рассылка завершена. Отправлено: {sent}, не доставлено: {failed}."
+        )
+    except Exception:
+        pass
+
+
 def register_handlers(dp: Dispatcher):
+    dp.middleware.setup(BanCheckMiddleware())
+
     dp.register_message_handler(
         cmd_start,
         commands=["start"],
@@ -927,6 +1059,18 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         cmd_stopgame,
         commands=["stopgame"],
+    )
+    dp.register_message_handler(
+        cmd_ban,
+        commands=["ban"],
+    )
+    dp.register_message_handler(
+        cmd_unban,
+        commands=["unban"],
+    )
+    dp.register_message_handler(
+        cmd_broadcast,
+        commands=["broadcast"],
     )
     dp.register_callback_query_handler(
         handle_game_join,
