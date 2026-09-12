@@ -20,6 +20,15 @@ async def init_db():
             )
         """)
 
+        # Миграция: бан пользователей (для админ-панели). CREATE TABLE
+        # IF NOT EXISTS не добавляет колонки в уже существующую таблицу,
+        # поэтому добавляем через ALTER TABLE и глушим ошибку, если
+        # колонка уже была добавлена раньше.
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -177,6 +186,34 @@ async def find_telegram_id_by_username(username):
         )
         row = await cursor.fetchone()
         return row[0] if row else None
+
+
+async def set_user_banned(telegram_id, is_banned):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "UPDATE users SET is_banned = ? WHERE telegram_id = ?",
+            (1 if is_banned else 0, telegram_id),
+        )
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def is_user_banned(telegram_id):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT is_banned FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        row = await cursor.fetchone()
+        return bool(row and row[0])
+
+
+async def get_all_telegram_ids():
+    """Список telegram_id всех известных боту пользователей — для /broadcast."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT telegram_id FROM users")
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
 
 
 async def save_message(user_id, role, content, chat_id=None):
