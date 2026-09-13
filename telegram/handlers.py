@@ -25,6 +25,7 @@ from database.db import (
     get_all_telegram_ids,
 )
 from config.settings import ADMIN_IDS
+from router.business import inspect_update_for_business_fields
 from aiogram.dispatcher.middlewares import BaseMiddleware
 from aiogram.dispatcher.handler import CancelHandler
 from router.game_logic import (
@@ -930,6 +931,22 @@ class BanCheckMiddleware(BaseMiddleware):
             raise CancelHandler()
 
 
+class BusinessDiagnosticMiddleware(BaseMiddleware):
+    """
+    ЭТАП 1 поддержки Telegram Business Mode: только логирует, если в
+    сыром апдейте нашлось что-то похожее на business_connection /
+    business_message — чтобы по логам Render понять, доходят ли такие
+    апдейты вообще через aiogram==2.15 (она вышла раньше этой фичи
+    Telegram и не имеет для неё типизированной поддержки).
+
+    Ничего не блокирует и не меняет в обычной обработке апдейтов —
+    полностью безопасно для всего остального бота.
+    """
+
+    async def on_pre_process_update(self, update: types.Update, data: dict):
+        inspect_update_for_business_fields(update)
+
+
 async def _resolve_target_telegram_id(message: types.Message):
     """
     Определяет telegram_id пользователя-цели для /ban и /unban:
@@ -1040,6 +1057,7 @@ async def cmd_broadcast(message: types.Message):
 
 def register_handlers(dp: Dispatcher):
     dp.middleware.setup(BanCheckMiddleware())
+    dp.middleware.setup(BusinessDiagnosticMiddleware())
 
     dp.register_message_handler(
         cmd_start,
