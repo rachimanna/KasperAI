@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import resource
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -30,6 +31,36 @@ def run_health_server():
     port = int(os.getenv("PORT", "10000"))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
+
+
+def _current_memory_mb() -> float:
+    """
+    Пиковое потребление памяти процесса в МБ через resource.getrusage —
+    без сторонних зависимостей (psutil не установлена, добавлять её ради
+    одной метрики незачем). На Linux ru_maxrss в килобайтах.
+
+    Нужно, потому что Render Metrics -> Memory на free-тарифе недоступен
+    (это платная фича, "Application Metrics" под платным планом) — так
+    единственный способ понять, упирается ли процесс в лимит 512MB,
+    это логировать это самостоятельно и смотреть в обычных логах Render.
+    """
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+async def memory_logger_loop(interval_seconds: int = 60):
+    """
+    Раз в interval_seconds логирует текущее (пиковое) потребление памяти
+    процесса. Позволяет по логам Render сопоставить моменты рестартов
+    (TerminatedByOtherGetUpdates и т.п.) с уровнем памяти прямо перед этим —
+    без доступа к платным Application Metrics.
+    """
+    while True:
+        try:
+            mb = _current_memory_mb()
+            print(f"[memory] RSS peak = {mb:.1f} MB (limit 512 MB on free tier)", flush=True)
+        except Exception as e:
+            print(f"[memory] logger error: {e}", flush=True)
+        await asyncio.sleep(interval_seconds)
 
 
 async def on_startup(dp):
@@ -80,11 +111,20 @@ async def on_startup(dp):
     # пересыпание/передеплой Render.
     asyncio.create_task(phase_checker_loop(dp.bot))
 
+    # Логирование памяти каждую минуту — см. _current_memory_mb выше:
+    # единственный способ следить за потреблением на free-тарифе Render,
+    # где графики памяти скрыты за платным планом.
+    asyncio.create_task(memory_logger_loop())
+
     print("Database: OK")
     print("Kasper AI is running.")
 
 
 async def on_shutdown(dp):
+    try:
+        print(f"[memory] RSS at shutdown = {_current_memory_mb():.1f} MB", flush=True)
+    except Exception as e:
+        print(f"[memory] shutdown logging error: {e}", flush=True)
     await close_http_session()
 
 
