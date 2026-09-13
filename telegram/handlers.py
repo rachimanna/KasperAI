@@ -34,6 +34,7 @@ from router.game_logic import (
     phase_checker_loop,
     role_reveal_text,
     capture_last_words,
+    SKIP_TARGET_ID,
 )
 from router.ai_router import (
     ask,
@@ -866,6 +867,25 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
 
     await handle_vote_action(game_id, phase_number, voter_user_id, target_user_id)
     await callback_query.answer("Голос учтён ✅")
+
+    voter_name = f"@{telegram_user.username}" if telegram_user.username else f"id{telegram_user.id}"
+
+    if target_user_id == SKIP_TARGET_ID:
+        announce = f"🗳 {voter_name} решил(а) пропустить голос."
+    else:
+        players = await get_game_players(game_id)
+        target_row = next((p for p in players if p[1] == target_user_id), None)
+        if target_row:
+            _pid, _uid, target_telegram_id, target_username, _role, _alive = target_row
+            target_name = f"@{target_username}" if target_username else f"id{target_telegram_id}"
+        else:
+            target_name = "неизвестного игрока"
+        announce = f"🗳 {voter_name} проголосовал(а) за {target_name}."
+
+    try:
+        await callback_query.bot.send_message(callback_query.message.chat.id, announce)
+    except Exception as e:
+        print(f"[game] vote announce ERROR: {e}", flush=True)
 
 
 async def handle_game_stop(callback_query: types.CallbackQuery):
