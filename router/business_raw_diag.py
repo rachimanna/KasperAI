@@ -1,47 +1,47 @@
 """
-Диагностика Telegram Business Mode (Secretary Mode) на уровне сырого JSON.
+Перехват сырого JSON апдейтов Telegram Business Mode + диспетчеризация
+в реальную обработку (router.business.handle_business_message).
 
-КОНТЕКСТ / почему прежняя диагностика в router/business.py молчала:
-BusinessDiagnosticMiddleware.on_pre_process_update(update, data) получает
-уже готовый объект aiogram.types.Update. Но types.Update в aiogram==2.15 —
-модель с жёстко описанным списком полей (update_id, message,
-edited_message, channel_post, ..., poll_answer), написанная ДО того, как
-Telegram добавил business_connection / business_message /
-edited_business_message в Bot API 7.2 (март 2024). Разбирая JSON, aiogram
-просто отбрасывает ключи, которых не знает — значит
-getattr(update, "business_message", None) физически не может найти эти
-данные, сколько угодно бизнес-сообщений ни присылай собеседнику. Дело не в
-том, что Telegram их не шлёт, а в том, что aiogram отбрасывает их раньше,
-чем мидлварь увидит апдейт.
+КОНТЕКСТ / почему диагностика на уровне types.Update молчала:
+aiogram.types.Update в aiogram==2.15 — модель с жёстко описанным списком
+полей (update_id, message, edited_message, channel_post, ...,
+poll_answer), написанная ДО того, как Telegram добавил business_connection
+/ business_message / edited_business_message в Bot API 7.2 (март 2024).
+Разбирая JSON, aiogram просто отбрасывает ключи, которых не знает —
+поэтому смотреть на уже готовый types.Update бесполезно, эти данные там
+физически отсутствуют.
 
 ГДЕ РЕАЛЬНО ЕЩЁ ЖИВ СЫРОЙ JSON:
 aiogram.bot.api.make_request() делает единственный HTTP-запрос и передаёт
-сырой текст ответа (await response.text()) в модульную функцию
-check_result(method_name, content_type, status_code, body). Именно она
-через json.loads(body) получает чистый dict Telegram-ответа и возвращает
+сырой текст ответа в модульную функцию
+check_result(method_name, content_type, status_code, body). Она через
+json.loads(body) получает чистый dict Telegram-ответа и возвращает
 result_json.get('result') — ДО какой-либо типизации в types.Update. Для
-метода getUpdates result — это список сырых dict'ов апдейтов, и если
-Telegram прислал business_connection/business_message, эти ключи в этом
-dict будут на месте.
+getUpdates result — список сырых dict'ов апдейтов, где business_connection
+/ business_message ещё на месте, если Telegram их прислал.
 
-Патчим именно check_result (не get_updates, не Bot.request) — это функция
+Патчим именно check_result (не get_updates, не Bot.request) — функция
 уровня модуля, вызывается ровно один раз на каждый реальный HTTP-ответ,
 поэтому патч не создаёт никаких дополнительных запросов к Telegram API и
 не может спровоцировать TerminatedByOtherGetUpdates.
 
-Подключение (в main.py, один раз при импорте, до executor.start_polling):
+ПОЧЕМУ ЗДЕСЬ ИСПОЛЬЗУЕТСЯ asyncio.create_task, А НЕ await:
+check_result — синхронная функция (нет async/await в её сигнатуре в самом
+aiogram). Настоящая обработка business-сообщения асинхронна (спрашивает
+AI, шлёт ответ через bot.request) — значит её нельзя просто await'нуть
+внутри синхронного патча. Вместо этого планируем её как отдельную задачу
+в уже существующем event loop через asyncio.create_task: это не блокирует
+check_result и не задерживает обработку остальных апдейтов, а вопрос к AI
+и ответ уходят своим чередом в фоне.
+
+Подключение (в main.py, один раз при старте, после создания bot, до
+executor.start_polling):
 
     from router.business_raw_diag import patch_check_result_for_business_diag
-    patch_check_result_for_business_diag()
-
-После того как в логах Render появится реальная структура
-business_connection / business_message (ключи business_connection_id,
-chat, from, message, date и т.д.) — можно писать финальную логику ответа
-через сырой HTTP-запрос sendMessage с business_connection_id (aiogram==2.15
-не поддерживает этот параметр в типизированных методах). После этого
-данный модуль можно удалить или оставить как safety-net логирование.
+    patch_check_result_for_business_diag(bot)
 """
 
+import asyncio
 import json as _json
 
 _BUSINESS_KEYS = (
@@ -54,17 +54,19 @@ _BUSINESS_KEYS = (
 _patched = False
 
 
-def patch_check_result_for_business_diag() -> None:
+def patch_check_result_for_business_diag(bot) -> None:
     """
-    Патчит aiogram.bot.api.check_result глобально для процесса (это
-    свободная функция модуля, не метод инстанса — переопределяем один
-    раз при старте, безопасно вызывать многократно благодаря _patched).
+    Патчит aiogram.bot.api.check_result глобально для процесса.
+    Принимает bot, чтобы держать его в замыкании и передавать в
+    handle_business_message для отправки ответов через
+    business_connection_id (сырой check_result этого объекта не имеет).
     """
     global _patched
     if _patched:
         return
 
     from aiogram.bot import api as aiogram_api
+    from router.business import handle_business_message
 
     original_check_result = aiogram_api.check_result
 
@@ -75,6 +77,7 @@ def patch_check_result_for_business_diag() -> None:
                 for raw_update in raw.get("result", []) or []:
                     if not isinstance(raw_update, dict):
                         continue
+
                     found_keys = [k for k in _BUSINESS_KEYS if k in raw_update]
                     if found_keys:
                         print(
@@ -82,9 +85,21 @@ def patch_check_result_for_business_diag() -> None:
                             f"keys={found_keys} raw={_json.dumps(raw_update, ensure_ascii=False)}",
                             flush=True,
                         )
+
+                    # business_message — новое сообщение в подключённом
+                    # business-чате (от владельца аккаунта или его
+                    # собеседника, оба приходят через один и тот же
+                    # business_connection владельца). Реальную обработку
+                    # (проверка триггера "Каспер", вызов AI, ответ) не
+                    # делаем здесь синхронно — планируем как задачу.
+                    business_message = raw_update.get("business_message")
+                    if isinstance(business_message, dict):
+                        asyncio.create_task(
+                            handle_business_message(bot, business_message)
+                        )
             except Exception as e:
-                # Диагностика никогда не должна ронять реальную обработку
-                # ответа — просто логируем и передаём управление дальше.
+                # Диагностика/диспетчеризация не должна ронять реальную
+                # обработку ответа — логируем и передаём управление дальше.
                 print(f"[business] RAW DIAG error (non-fatal): {e}", flush=True)
 
         # Настоящий разбор ответа — без него сломается вообще всё, не
