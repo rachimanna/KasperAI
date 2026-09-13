@@ -1,5 +1,6 @@
 import asyncio
 import re
+import time
 
 from aiogram import Dispatcher, types
 
@@ -48,6 +49,21 @@ from router.ai_router import (
 )
 from router.web_search import tavily_search, format_search_results
 from router.music import download_music
+from router.agent import (
+    AGENT_SESSIONS,
+    AgentError,
+    build_plan_with_fallback,
+    format_plan_text,
+    format_progress_text,
+    run_step,
+    should_use_agent,
+    has_agent_hint,
+    check_and_increment_agent_limit,
+    AGENT_DAILY_LIMIT,
+    STEP_GENERATE_SITE,
+    TASK_TIMEOUT_SECONDS,
+)
+from router.agent_ui import plan_confirmation_keyboard, stop_keyboard
 import aiohttp
 
 TRIGGER_PATTERN = re.compile(r"каспер|kasper", re.IGNORECASE)
@@ -86,6 +102,260 @@ def needs_smart_classification(text: str) -> bool:
     return bool(FAST_CLASSIFY_PATTERN.search(text))
 
 PENDING_SITE_REQUESTS = {}
+
+# Пользователи, у которых сейчас открыт диалог "уточни задачу для агента"
+# (после нажатия "✏️ Изменить"). Ожидаем следующее текстовое сообщение как
+# правку исходной задачи, а не как обычное сообщение Касперу.
+AGENT_AWAITING_EDIT = set()
+
+
+async def _start_agent_flow(message: types.Message, user_id: int, task_text: str):
+    """
+    Общая точка входа в агент-режим — вызывается и из команды /agent, и из
+    автодетекции в handle_message. Строит план и показывает его с кнопками
+    подтверждения. Любая ошибка здесь ловится вызывающим кодом — при сбое
+    агент-режим просто сообщает об ошибке, не трогая обычный чат.
+    """
+    allowed, remaining = check_and_increment_agent_limit(user_id)
+    if not allowed:
+        await message.answer(
+            f"⛔ Лимит запусков агента на сегодня исчерпан ({AGENT_DAILY_LIMIT} в день). "
+            "Попробуй завтра или обратись как обычно — без агент-режима."
+        )
+        return
+
+    status_message = await message.answer("🧠 Строю план выполнения задачи...")
+
+    try:
+        plan = await build_plan_with_fallback(task_text)
+    except AgentError as e:
+        await status_message.edit_text(f"⚠️ Не удалось построить план: {e}")
+        return
+    except Exception as e:
+        print(f"[agent] build_plan unexpected ERROR: {e}", flush=True)
+        await status_message.edit_text("⚠️ Не удалось построить план из-за внутренней ошибки.")
+        return
+
+    AGENT_SESSIONS[user_id] = {
+        "task": task_text,
+        "plan": plan,
+        "status": "awaiting_confirm",
+        "results": [],
+        "chat_id": message.chat.id,
+    }
+
+    plan_text = format_plan_text(task_text, plan)
+    try:
+        await status_message.edit_text(
+            plan_text,
+            parse_mode="HTML",
+            reply_markup=plan_confirmation_keyboard(),
+        )
+    except Exception:
+        await message.answer(
+            plan_text,
+            parse_mode="HTML",
+            reply_markup=plan_confirmation_keyboard(),
+        )
+
+
+async def cmd_agent(message: types.Message):
+    parts = message.text.split(maxsplit=1)
+    user_id = await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
+
+    if len(parts) < 2 or not parts[1].strip():
+        AGENT_AWAITING_EDIT.add(user_id)
+        await message.answer(
+            "🧠 Опиши задачу для агента одним сообщением — что нужно найти, "
+            "сравнить, собрать или какой сайт сделать."
+        )
+        return
+
+    task_text = parts[1].strip()
+    await _start_agent_flow(message, user_id, task_text)
+
+
+async def _run_agent_plan(bot, chat_id: int, user_id: int):
+    """
+    Выполняет подтверждённый план по шагам, показывая живой прогресс в
+    одном редактируемом сообщении. Вызывается из callback-хендлера
+    agent_confirm, после того как пользователь нажал "✅ Выполнить".
+    """
+    session_data = AGENT_SESSIONS.get(user_id)
+    if not session_data:
+        return
+
+    task_text = session_data["task"]
+    plan = session_data["plan"]
+    session_data["status"] = "running"
+
+    progress_message = await bot.send_message(
+        chat_id,
+        format_progress_text(task_text, plan, 0),
+        parse_mode="HTML",
+        reply_markup=stop_keyboard(),
+    )
+
+    collected = []
+    site_files = []
+
+    async def _run_all_steps():
+        async with aiohttp.ClientSession() as agent_session:
+            for index, step in enumerate(plan["steps"]):
+                if AGENT_SESSIONS.get(user_id, {}).get("status") != "running":
+                    return  # остановлено пользователем через agent_stop
+
+                try:
+                    await progress_message.edit_text(
+                        format_progress_text(task_text, plan, index),
+                        parse_mode="HTML",
+                        reply_markup=stop_keyboard(),
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    result = await run_step(agent_session, task_text, step, collected)
+                except asyncio.TimeoutError:
+                    result = {
+                        "type": step["type"],
+                        "description": step["description"],
+                        "output": "⚠️ Шаг превысил лимит времени и был пропущен.",
+                    }
+                except Exception as e:
+                    print(f"[agent] run_step ERROR: {e}", flush=True)
+                    result = {
+                        "type": step["type"],
+                        "description": step["description"],
+                        "output": f"⚠️ Ошибка на шаге: {e}",
+                    }
+
+                collected.append(result)
+
+                if result.get("type") == STEP_GENERATE_SITE and result.get("html_code"):
+                    site_files.append((step["description"], result["html_code"]))
+
+        try:
+            await progress_message.edit_text(
+                format_progress_text(task_text, plan, len(plan["steps"])),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    try:
+        await asyncio.wait_for(_run_all_steps(), timeout=TASK_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        await bot.send_message(
+            chat_id,
+            "⏱ Задача заняла слишком много времени и была остановлена. "
+            "Вот что успело собраться:",
+        )
+
+    if AGENT_SESSIONS.get(user_id, {}).get("status") != "running":
+        AGENT_SESSIONS.pop(user_id, None)
+        return
+
+    for description, html_code in site_files:
+        try:
+            import os as _os
+            _os.makedirs("generated_sites", exist_ok=True)
+            site_path = f"generated_sites/agent_{user_id}_{int(time.time())}.html"
+            with open(site_path, "w", encoding="utf-8") as f:
+                f.write(html_code)
+            await bot.send_document(
+                chat_id,
+                types.InputFile(site_path),
+                caption=f"🌐 Сайт готов: {description[:200]}",
+            )
+        except Exception as e:
+            print(f"[agent] send site file ERROR: {e}", flush=True)
+
+    final_answers = [r["output"] for r in collected if r["type"] == "answer"]
+    if final_answers:
+        await bot.send_message(chat_id, final_answers[-1])
+    elif not site_files:
+        await bot.send_message(
+            chat_id,
+            "✅ План выполнен, но финального текстового ответа не было "
+            "сформировано (проверь шаги выше).",
+        )
+
+    AGENT_SESSIONS.pop(user_id, None)
+
+
+async def handle_agent_confirm(callback_query: types.CallbackQuery):
+    user_id = await get_or_create_user(
+        telegram_id=callback_query.from_user.id,
+        username=callback_query.from_user.username,
+    )
+    session_data = AGENT_SESSIONS.get(user_id)
+    if not session_data or session_data["status"] != "awaiting_confirm":
+        await callback_query.answer("План уже неактуален.", show_alert=True)
+        return
+
+    await callback_query.answer("Выполняю план...")
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    asyncio.create_task(
+        _run_agent_plan(callback_query.bot, callback_query.message.chat.id, user_id)
+    )
+
+
+async def handle_agent_cancel(callback_query: types.CallbackQuery):
+    user_id = await get_or_create_user(
+        telegram_id=callback_query.from_user.id,
+        username=callback_query.from_user.username,
+    )
+    AGENT_SESSIONS.pop(user_id, None)
+    AGENT_AWAITING_EDIT.discard(user_id)
+    await callback_query.answer("Отменено.")
+    try:
+        await callback_query.message.edit_text("❌ Задача для агента отменена.")
+    except Exception:
+        pass
+
+
+async def handle_agent_edit(callback_query: types.CallbackQuery):
+    user_id = await get_or_create_user(
+        telegram_id=callback_query.from_user.id,
+        username=callback_query.from_user.username,
+    )
+    session_data = AGENT_SESSIONS.get(user_id)
+    if not session_data:
+        await callback_query.answer("План уже неактуален.", show_alert=True)
+        return
+
+    AGENT_AWAITING_EDIT.add(user_id)
+    await callback_query.answer()
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback_query.message.answer(
+        "✏️ Опиши, что изменить в задаче — построю план заново."
+    )
+
+
+async def handle_agent_stop(callback_query: types.CallbackQuery):
+    user_id = await get_or_create_user(
+        telegram_id=callback_query.from_user.id,
+        username=callback_query.from_user.username,
+    )
+    session_data = AGENT_SESSIONS.get(user_id)
+    if session_data:
+        session_data["status"] = "stopped"
+    await callback_query.answer("Останавливаю...")
+    try:
+        await callback_query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
 
 # Через сколько новых сообщений после последней сумморизации запускать
 # обновление "скользящего" конспекта разговора.
@@ -258,6 +528,37 @@ async def handle_message(message: types.Message):
     if not is_group and capture_last_words(message.from_user.id, text):
         await message.answer("💬 Принято, твои последние слова переданы в группу.")
         return
+
+    # --- AI-агент режим: изолированная ветка, обёрнута так, чтобы любая её
+    # ошибка не мешала обычному диалогу с Каспером ниже. ---
+    try:
+        agent_user_id = await get_or_create_user(
+            telegram_id=message.from_user.id,
+            username=message.from_user.username,
+        )
+
+        if agent_user_id in AGENT_AWAITING_EDIT:
+            AGENT_AWAITING_EDIT.discard(agent_user_id)
+            await _start_agent_flow(message, agent_user_id, text)
+            return
+
+        if not is_group and has_agent_hint(text):
+            async with aiohttp.ClientSession() as _detect_session:
+                for _provider_try_agent in get_provider_order():
+                    try:
+                        is_agent_task = await should_use_agent(
+                            _detect_session, _provider_try_agent, text
+                        )
+                        break
+                    except Exception as _e_detect:
+                        print(f"[agent] detect {_provider_try_agent} ERROR: {_e_detect}", flush=True)
+                        is_agent_task = False
+                        continue
+            if is_agent_task:
+                await _start_agent_flow(message, agent_user_id, text)
+                return
+    except Exception as e:
+        print(f"[agent] routing ERROR (falling back to normal chat): {e}", flush=True)
 
     animation_message = None
     animation_task = None
@@ -1008,6 +1309,7 @@ async def cmd_broadcast(message: types.Message):
 
     photo_file_id = None
     text = None
+    entities = None  # список types.MessageEntity, включая custom_emoji, если они есть в исходнике
 
     if message.reply_to_message:
         # Рассылаем то сообщение, на которое ответили командой /broadcast —
@@ -1016,8 +1318,10 @@ async def cmd_broadcast(message: types.Message):
         if src.photo:
             photo_file_id = src.photo[-1].file_id
             text = src.caption or ""
+            entities = src.caption_entities or None
         else:
             text = src.text or src.caption or ""
+            entities = src.entities or src.caption_entities or None
     else:
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
@@ -1028,6 +1332,31 @@ async def cmd_broadcast(message: types.Message):
             )
             return
         text = parts[1]
+        # Если в самой команде /broadcast <текст> есть custom emoji, entities у этого
+        # сообщения тоже есть, но со сдвигом на длину "/broadcast " — пересчитываем offset.
+        if message.entities:
+            prefix_len = len(message.text) - len(text)
+            adjusted = []
+            for ent in message.entities:
+                if ent.offset + ent.length <= prefix_len:
+                    continue  # энтити целиком внутри "/broadcast ", не относится к тексту рассылки
+                new_offset = ent.offset - prefix_len
+                if new_offset < 0:
+                    # энтити частично перекрывает границу — обрезаем по границе,
+                    # чтобы не сломать смещения остальных символов
+                    continue
+                new_ent = ent.copy(deep=True) if hasattr(ent, "copy") else ent
+                new_ent = types.MessageEntity(
+                    type=ent.type,
+                    offset=new_offset,
+                    length=ent.length,
+                    url=ent.url,
+                    user=ent.user,
+                    language=ent.language,
+                    custom_emoji_id=getattr(ent, "custom_emoji_id", None),
+                )
+                adjusted.append(new_ent)
+            entities = adjusted or None
 
     telegram_ids = await get_all_telegram_ids()
     status_message = await message.answer(
@@ -1039,9 +1368,18 @@ async def cmd_broadcast(message: types.Message):
     for telegram_id in telegram_ids:
         try:
             if photo_file_id:
-                await message.bot.send_photo(telegram_id, photo_file_id, caption=text or None)
+                await message.bot.send_photo(
+                    telegram_id,
+                    photo_file_id,
+                    caption=text or None,
+                    caption_entities=entities,
+                )
             else:
-                await message.bot.send_message(telegram_id, text)
+                await message.bot.send_message(
+                    telegram_id,
+                    text,
+                    entities=entities,
+                )
             sent += 1
         except Exception:
             failed += 1
@@ -1090,6 +1428,26 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         cmd_broadcast,
         commands=["broadcast"],
+    )
+    dp.register_message_handler(
+        cmd_agent,
+        commands=["agent"],
+    )
+    dp.register_callback_query_handler(
+        handle_agent_confirm,
+        lambda c: c.data == "agent_confirm",
+    )
+    dp.register_callback_query_handler(
+        handle_agent_cancel,
+        lambda c: c.data == "agent_cancel",
+    )
+    dp.register_callback_query_handler(
+        handle_agent_edit,
+        lambda c: c.data == "agent_edit",
+    )
+    dp.register_callback_query_handler(
+        handle_agent_stop,
+        lambda c: c.data == "agent_stop",
     )
     dp.register_callback_query_handler(
         handle_game_join,
