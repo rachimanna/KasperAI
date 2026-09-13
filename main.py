@@ -11,6 +11,7 @@ from aiogram import executor
 from database.db import init_db
 from router.ai_router import init_http_session, close_http_session
 from router.game_logic import phase_checker_loop
+from router.business_raw_diag import patch_check_result_for_business_diag
 from telegram.handlers import register_handlers
 from config.settings import ADMIN_IDS
 
@@ -114,6 +115,15 @@ def main():
     dp = Dispatcher(bot)
 
     register_handlers(dp)
+
+    # Диагностика Telegram Business Mode: патчит aiogram.bot.api.check_result
+    # (см. router/business_raw_diag.py) — единственная точка, где ещё виден
+    # сырой JSON апдейта до того, как aiogram отбросит незнакомые ему поля
+    # business_connection/business_message при типизации в types.Update.
+    # Прежняя диагностика в BusinessDiagnosticMiddleware (telegram/handlers.py)
+    # смотрит на уже готовый Update и структурно не может найти эти поля —
+    # оставлена как есть, но полагаться на неё для этой цели не стоит.
+    patch_check_result_for_business_diag()
 
     executor.start_polling(
         dp,
