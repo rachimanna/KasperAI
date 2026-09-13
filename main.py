@@ -156,14 +156,16 @@ def main():
 
     register_handlers(dp)
 
-    # Диагностика Telegram Business Mode: патчит aiogram.bot.api.check_result
-    # (см. router/business_raw_diag.py) — единственная точка, где ещё виден
+    # Telegram Business Mode: патчит aiogram.bot.api.check_result (см.
+    # router/business_raw_diag.py) — единственная точка, где ещё виден
     # сырой JSON апдейта до того, как aiogram отбросит незнакомые ему поля
     # business_connection/business_message при типизации в types.Update.
+    # Оттуда же теперь реально диспетчеризуется обработка business-сообщений
+    # (router/business.py: триггер "Каспер" -> AI -> ответ в тот же чат).
     # Прежняя диагностика в BusinessDiagnosticMiddleware (telegram/handlers.py)
     # смотрит на уже готовый Update и структурно не может найти эти поля —
     # оставлена как есть, но полагаться на неё для этой цели не стоит.
-    patch_check_result_for_business_diag()
+    patch_check_result_for_business_diag(bot)
 
     executor.start_polling(
         dp,
