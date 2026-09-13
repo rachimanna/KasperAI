@@ -48,8 +48,8 @@ async def on_startup(dp):
     await dp.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
-        BotCommand("game", "Начать игру «Теневой город»"),
-        BotCommand("stopgame", "Остановить текущую игру"),
+        BotCommand("shadowcity", "Начать игру «Теневой город»"),
+        BotCommand("stopshadowcity", "Остановить текущую игру"),
     ])
 
     # Админские команды показываем в подсказках только самим админам —
@@ -58,8 +58,8 @@ async def on_startup(dp):
     admin_commands = [
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
-        BotCommand("game", "Начать игру «Теневой город»"),
-        BotCommand("stopgame", "Остановить текущую игру"),
+        BotCommand("shadowcity", "Начать игру «Теневой город»"),
+        BotCommand("stopshadowcity", "Остановить текущую игру"),
         BotCommand("ban", "Забанить пользователя (ответом/@username/id)"),
         BotCommand("unban", "Разбанить пользователя (ответом/@username/id)"),
         BotCommand("broadcast", "Рассылка всем пользователям"),
