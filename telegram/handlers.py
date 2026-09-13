@@ -58,6 +58,7 @@ from router.agent import (
     run_step,
     should_use_agent,
     has_agent_hint,
+    is_actual_task,
     check_and_increment_agent_limit,
     AGENT_DAILY_LIMIT,
     STEP_GENERATE_SITE,
@@ -561,8 +562,32 @@ async def handle_message(message: types.Message):
         )
 
         if not is_group and _pop_awaiting_agent_input(agent_user_id):
-            await _start_agent_flow(message, agent_user_id, text)
-            return
+            async with aiohttp.ClientSession() as _task_check_session:
+                confirmed_task = False
+                for _provider_try_check_task in get_provider_order():
+                    try:
+                        confirmed_task = await is_actual_task(
+                            _task_check_session, _provider_try_check_task, text
+                        )
+                        break
+                    except Exception as _e_check_task:
+                        print(f"[agent] is_actual_task {_provider_try_check_task} ERROR: {_e_check_task}", flush=True)
+                        continue
+
+            if confirmed_task:
+                await _start_agent_flow(message, agent_user_id, text)
+                return
+
+            # Похоже не на задачу, а на обычную реплику — не строим план,
+            # снова ждём задачу и продолжаем как обычный диалог с Каспером
+            # (без return, чтобы это же сообщение обработалось ниже как
+            # обычный чат).
+            _mark_awaiting_agent_input(agent_user_id)
+            await message.answer(
+                "🧠 Похоже, это не задача для агента. Опиши, что нужно "
+                "найти/сравнить/собрать или какой сайт сделать — или просто "
+                "продолжай общаться, я отвечу как обычно."
+            )
 
         if not is_group and has_agent_hint(text):
             async with aiohttp.ClientSession() as _detect_session:
