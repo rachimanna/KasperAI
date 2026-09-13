@@ -665,10 +665,6 @@ def _build_lobby_keyboard(bot_username, players_count, max_players=10):
     )
     keyboard.add(
         types.InlineKeyboardButton(
-            text="🎮 Начать игру",
-            callback_data="game_start",
-        ),
-        types.InlineKeyboardButton(
             text="🛑 Остановить",
             callback_data="game_stop",
         ),
@@ -786,6 +782,21 @@ async def handle_game_join(callback_query: types.CallbackQuery):
         return
 
     players = await get_game_players(game_id)
+
+    # Как только набирается минимум игроков — игра стартует сама,
+    # отдельная кнопка "Начать игру" больше не нужна.
+    if len(players) >= MIN_GAME_PLAYERS:
+        try:
+            await callback_query.message.edit_text(
+                "🎮 Игра началась! Роли разосланы в личные сообщения.",
+            )
+        except Exception as e:
+            print(f"[game] lobby auto-start edit ERROR: {e}", flush=True)
+
+        await callback_query.answer("Игра началась! Проверь личные сообщения от бота 📩", show_alert=True)
+        await start_game(callback_query.bot, game_id, chat_id)
+        return
+
     keyboard = _build_lobby_keyboard(None, len(players))
     text = _build_lobby_text(players)
 
@@ -795,36 +806,6 @@ async def handle_game_join(callback_query: types.CallbackQuery):
         print(f"[game] lobby edit ERROR: {e}", flush=True)
 
     await callback_query.answer("Ты в игре! 🎮")
-
-
-async def handle_game_start(callback_query: types.CallbackQuery):
-    chat_id = callback_query.message.chat.id
-    game = await get_active_game(chat_id)
-
-    if not game or game[2] != "lobby":
-        await callback_query.answer("Игру уже нельзя начать сейчас.", show_alert=True)
-        return
-
-    game_id = game[0]
-    players = await get_game_players(game_id)
-
-    if len(players) < MIN_GAME_PLAYERS:
-        await callback_query.answer(
-            f"Нужно минимум {MIN_GAME_PLAYERS} игрока, сейчас {len(players)}.",
-            show_alert=True,
-        )
-        return
-
-    try:
-        await callback_query.message.edit_text(
-            "🎮 Игра началась! Роли разосланы в личные сообщения.",
-        )
-    except Exception:
-        pass
-
-    await callback_query.answer("Игра началась! Проверь личные сообщения от бота 📩", show_alert=True)
-
-    await start_game(callback_query.bot, game_id, chat_id)
 
 
 async def handle_game_night_action(callback_query: types.CallbackQuery):
@@ -1075,10 +1056,6 @@ def register_handlers(dp: Dispatcher):
     dp.register_callback_query_handler(
         handle_game_join,
         lambda c: c.data == "game_join",
-    )
-    dp.register_callback_query_handler(
-        handle_game_start,
-        lambda c: c.data == "game_start",
     )
     dp.register_callback_query_handler(
         handle_game_stop,
