@@ -80,6 +80,7 @@ async def on_startup(dp):
     await dp.bot.set_my_commands([
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
+        BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
     ])
@@ -90,6 +91,7 @@ async def on_startup(dp):
     admin_commands = [
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
+        BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
         BotCommand("ban", "Забанить пользователя (ответом/@username/id)"),
