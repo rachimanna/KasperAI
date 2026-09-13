@@ -39,7 +39,7 @@ STEP_TIMEOUT_SECONDS = 40
 # лимита сообщений (check_and_increment_limit), т.к. один запуск агента
 # по стоимости эквивалентен нескольким обычным AI-запросам (план + шаги
 # + синтез финального ответа).
-AGENT_DAILY_LIMIT = int(os.getenv("AGENT_DAILY_LIMIT", "5"))
+AGENT_DAILY_LIMIT = int(os.getenv("AGENT_DAILY_LIMIT", "15"))
 
 # {user_id: {"day": "YYYY-MM-DD", "count": int}}
 _AGENT_USAGE = {}
@@ -73,6 +73,59 @@ AGENT_HINT_PATTERN = re.compile(
 
 def has_agent_hint(text: str) -> bool:
     return bool(AGENT_HINT_PATTERN.search(text))
+
+
+# Явно не-задачи: короткие реплики/приветствия/эмоции, которые не должны
+# уходить в построение плана, даже когда пользователь только что вызвал
+# /agent и следующим сообщением написал что-то не по адресу.
+NOT_A_TASK_PATTERN = re.compile(
+    r"^\s*("
+    r"привет\w*|здравствуй\w*|хай|йо|ку|"
+    r"как дела\??|как ты\??|как жизнь\??|что как\??|"
+    r"да|нет|ок|окей|ладно|спасибо|благодарю|пока|"
+    r"ору|лол|ахах\w*|хах\w*|😂+|👍+"
+    r")\s*[!.?]*\s*$",
+    re.IGNORECASE,
+)
+
+
+TASK_CHECK_SYSTEM_PROMPT = (
+    "Пользователь только что вызвал команду AI-агента и ему предложили "
+    "описать задачу (что найти/сравнить/собрать/какой сайт сделать). "
+    "Определи: то, что он написал СЕЙЧАС — это реальная задача для "
+    "агента, или это случайная/неотносящаяся реплика (приветствие, "
+    "вопрос 'как дела', благодарность, короткая эмоция, разговор не по "
+    "теме)? Ответь СТРОГО JSON без пояснений: "
+    '{"is_task": true/false}'
+)
+
+
+async def is_actual_task(session, provider, user_text: str) -> bool:
+    """
+    Дешёвый первый фильтр через regex, и только если он не дал однозначного
+    ответа — уточняющий AI-запрос. Нужен, чтобы после /agent случайное
+    "привет как дела" не улетало в план вместо вежливого переспроса.
+    """
+    if NOT_A_TASK_PATTERN.match(user_text.strip()):
+        return False
+
+    if len(user_text.strip()) < 4:
+        return False
+
+    try:
+        messages = [
+            {"role": "system", "content": TASK_CHECK_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ]
+        raw = await ask_provider(session, provider, messages)
+        raw = _strip_json_fences(raw)
+        data = json.loads(raw)
+        return bool(data.get("is_task", True))
+    except Exception as e:
+        print(f"[agent] is_actual_task {provider} ERROR: {e}", flush=True)
+        # При сбое классификатора не блокируем пользователя — считаем задачей,
+        # как было в исходном поведении до этого фикса.
+        return True
 
 
 def _today_str():
