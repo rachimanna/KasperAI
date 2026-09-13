@@ -104,9 +104,25 @@ def needs_smart_classification(text: str) -> bool:
 PENDING_SITE_REQUESTS = {}
 
 # Пользователи, у которых сейчас открыт диалог "уточни задачу для агента"
-# (после нажатия "✏️ Изменить"). Ожидаем следующее текстовое сообщение как
-# правку исходной задачи, а не как обычное сообщение Касперу.
-AGENT_AWAITING_EDIT = set()
+# (после /agent без текста или нажатия "✏️ Изменить"). Ожидаем следующее
+# текстовое сообщение как задачу/правку для агента, а не обычный вопрос
+# Касперу. Значение — unix-время истечения ожидания: если пользователь
+# забыл, что вызывал /agent, и просто продолжил обычный разговор через
+# несколько минут, это не должно неожиданно утянуть сообщение в агента.
+AGENT_AWAITING_EDIT = {}
+AGENT_AWAITING_EDIT_TTL_SECONDS = 180
+
+
+def _mark_awaiting_agent_input(user_id: int):
+    AGENT_AWAITING_EDIT[user_id] = time.time() + AGENT_AWAITING_EDIT_TTL_SECONDS
+
+
+def _pop_awaiting_agent_input(user_id: int) -> bool:
+    """True, если пользователь реально ожидался и ожидание не истекло."""
+    expires_at = AGENT_AWAITING_EDIT.pop(user_id, None)
+    if expires_at is None:
+        return False
+    return time.time() < expires_at
 
 
 async def _start_agent_flow(message: types.Message, user_id: int, task_text: str):
@@ -160,6 +176,13 @@ async def _start_agent_flow(message: types.Message, user_id: int, task_text: str
 
 
 async def cmd_agent(message: types.Message):
+    if message.chat.type in ("group", "supergroup"):
+        await message.answer(
+            "🧠 Агент-режим работает только в личных сообщениях боту, "
+            "чтобы не мешать общему чату. Напиши мне в лс."
+        )
+        return
+
     parts = message.text.split(maxsplit=1)
     user_id = await get_or_create_user(
         telegram_id=message.from_user.id,
@@ -167,7 +190,7 @@ async def cmd_agent(message: types.Message):
     )
 
     if len(parts) < 2 or not parts[1].strip():
-        AGENT_AWAITING_EDIT.add(user_id)
+        _mark_awaiting_agent_input(user_id)
         await message.answer(
             "🧠 Опиши задачу для агента одним сообщением — что нужно найти, "
             "сравнить, собрать или какой сайт сделать."
@@ -314,7 +337,7 @@ async def handle_agent_cancel(callback_query: types.CallbackQuery):
         username=callback_query.from_user.username,
     )
     AGENT_SESSIONS.pop(user_id, None)
-    AGENT_AWAITING_EDIT.discard(user_id)
+    AGENT_AWAITING_EDIT.pop(user_id, None)
     await callback_query.answer("Отменено.")
     try:
         await callback_query.message.edit_text("❌ Задача для агента отменена.")
@@ -332,7 +355,7 @@ async def handle_agent_edit(callback_query: types.CallbackQuery):
         await callback_query.answer("План уже неактуален.", show_alert=True)
         return
 
-    AGENT_AWAITING_EDIT.add(user_id)
+    _mark_awaiting_agent_input(user_id)
     await callback_query.answer()
     try:
         await callback_query.message.edit_reply_markup(reply_markup=None)
@@ -537,8 +560,7 @@ async def handle_message(message: types.Message):
             username=message.from_user.username,
         )
 
-        if agent_user_id in AGENT_AWAITING_EDIT:
-            AGENT_AWAITING_EDIT.discard(agent_user_id)
+        if not is_group and _pop_awaiting_agent_input(agent_user_id):
             await _start_agent_flow(message, agent_user_id, text)
             return
 
