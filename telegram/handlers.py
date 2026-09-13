@@ -1054,11 +1054,11 @@ def register_handlers(dp: Dispatcher):
     )
     dp.register_message_handler(
         cmd_game,
-        commands=["game"],
+        commands=["shadowcity"],
     )
     dp.register_message_handler(
         cmd_stopgame,
-        commands=["stopgame"],
+        commands=["stopshadowcity"],
     )
     dp.register_message_handler(
         cmd_ban,
