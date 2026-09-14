@@ -44,6 +44,7 @@ from database.db import (
     get_game_action,
     get_actions_by_type,
     get_games_with_expired_phase,
+    record_player_game_result,
 )
 
 NIGHT_DURATION_SECONDS = 60
@@ -222,6 +223,15 @@ ACTION_VERBS = {
     ACTION_HEAL: "спасти",
 }
 
+# Иконка и заголовок действия для визуала ночного сообщения — отдельно от
+# ACTION_VERBS (тот нужен для текста внутри предложения "кого хочешь
+# устранить", а этот — для заголовка карточки действия).
+ACTION_HEADERS = {
+    ACTION_KILL: ("🕶", "Ход Тени"),
+    ACTION_CHECK: ("🔍", "Ход Детектива"),
+    ACTION_HEAL: ("💊", "Ход Доктора"),
+}
+
 
 async def _send_night_action_keyboard(bot, game_id, phase_number, actor_row, players, action_type, allow_self=False):
     from aiogram import types
@@ -237,6 +247,9 @@ async def _send_night_action_keyboard(bot, game_id, phase_number, actor_row, pla
         return
 
     verb = ACTION_VERBS.get(action_type, "выбрать")
+    icon, header = ACTION_HEADERS.get(action_type, ("🌙", "Ночное действие"))
+    alive_count = len(_alive_players(players))
+
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     for t in targets:
         _tpid, target_user_id, target_telegram_id, target_username, _trole, _talive = t
@@ -250,10 +263,17 @@ async def _send_night_action_keyboard(bot, game_id, phase_number, actor_row, pla
             )
         )
 
+    text = (
+        f"{icon} <b>{header}</b>\n"
+        f"🌃 Ночь {phase_number} · в живых: {alive_count}\n\n"
+        f"Кого хочешь {verb}?"
+    )
+
     try:
         await bot.send_message(
             actor_telegram_id,
-            f"Кого хочешь {verb} этой ночью?",
+            text,
+            parse_mode="HTML",
             reply_markup=keyboard,
         )
     except Exception as e:
@@ -296,11 +316,18 @@ async def handle_vote_action(game_id, phase_number, actor_user_id, target_user_i
 
 async def _send_voting_message(bot, chat_id, game_id, players, text):
     keyboard = await _build_voting_keyboard(game_id, players)
+    alive = _alive_players(players)
+    alive_names = "\n".join(
+        f"• {_display_name(p[3], p[2])}" for p in alive
+    )
     try:
         await bot.send_message(
             chat_id,
-            f"{text}\n\n🗳 Голосуйте, кого подозреваете в роли Тени "
-            f"({VOTING_DURATION_SECONDS} секунд):",
+            f"{text}\n\n"
+            f"🗳 <b>Голосование</b> ({VOTING_DURATION_SECONDS} сек.)\n"
+            f"Кого подозреваете в роли Тени?\n\n"
+            f"👥 <b>В живых ({len(alive)}):</b>\n{alive_names}",
+            parse_mode="HTML",
             reply_markup=keyboard,
         )
     except Exception as e:
@@ -378,6 +405,7 @@ async def resolve_night(bot, game_id):
     win_message = _check_win_condition(players)
     if win_message:
         await set_game_phase(game_id, status="finished", phase_ends_at=None)
+        await record_game_result(players)
         try:
             await bot.send_message(
                 chat_id,
@@ -497,6 +525,7 @@ async def resolve_voting(bot, game_id):
     win_message = _check_win_condition(players)
     if win_message:
         await set_game_phase(game_id, status="finished", phase_ends_at=None)
+        await record_game_result(players)
         try:
             await bot.send_message(
                 chat_id,
@@ -545,6 +574,47 @@ def _role_reveal_text(players):
         label = role_labels.get(role, "❓ Неизвестно")
         lines.append(f"• {name} — {label}{status}")
     return "\n".join(lines)
+
+
+def _determine_winner(players):
+    """
+    Программный аналог _check_win_condition — возвращает "shadow",
+    "civilians" или None (игра продолжается), без текста объявления.
+    Используется для записи статистики, где нужен факт победителя, а не
+    готовая фраза для чата.
+    """
+    alive = _alive_players(players)
+    shadow_alive = [p for p in alive if p[4] == "shadow"]
+    others_alive = [p for p in alive if p[4] != "shadow"]
+
+    if not shadow_alive:
+        return "civilians"
+    if len(shadow_alive) >= len(others_alive):
+        return "shadow"
+    return None
+
+
+async def record_game_result(players):
+    """
+    Записывает итог завершённой партии в статистику каждого игрока —
+    вызывается один раз из resolve_night/resolve_voting сразу после того,
+    как подтверждено, что игра закончилась (_check_win_condition вернул
+    не-None). Сторона "shadow" считается победившей, если её роль
+    совпала с определённым победителем; все остальные роли — на стороне
+    мирных жителей.
+    """
+    winner = _determine_winner(players)
+    if not winner:
+        return
+
+    for p in players:
+        _pid, user_id, _telegram_id, _username, role, _is_alive = p
+        player_side = "shadow" if role == "shadow" else "civilians"
+        won = player_side == winner
+        try:
+            await record_player_game_result(user_id, role, won)
+        except Exception as e:
+            print(f"[game] record_player_game_result ERROR user_id={user_id}: {e}", flush=True)
 
 
 def _check_win_condition(players):
