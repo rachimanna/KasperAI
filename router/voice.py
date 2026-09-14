@@ -21,6 +21,8 @@ import logging
 import aiohttp
 from gtts import gTTS
 
+from router.ai_router import get_provider_order
+
 log = logging.getLogger(__name__)
 
 GROQ_WHISPER_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
@@ -135,8 +137,6 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
 
     history = await get_history_fn(user_id, limit=5, chat_id=chat_id)
 
-    from config.settings import AI_PROVIDERS
-
     KASPER_SYSTEM_PROMPT = (
         "Ты — Kasper AI, ИИ-помощник в Telegram с дерзким, злым-но-своим "
         "характером, созданный разработчиками Kasper AI. Если спросят, кто "
@@ -148,14 +148,28 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
     )
 
     messages = [{"role": "system", "content": KASPER_SYSTEM_PROMPT}]
-    for h in history:
-        messages.append({"role": h["role"], "content": h["content"]})
+
+    # ВАЖНО: get_history() возвращает кортежи (role, content) из sqlite,
+    # а не словари. Раньше здесь стояло h["role"] — это падало с TypeError
+    # на каждом голосовом сообщении. Поддерживаем оба варианта на случай,
+    # если row_factory когда-нибудь поменяют на dict/sqlite3.Row.
+    for row in history:
+        if isinstance(row, dict):
+            role, content = row.get("role"), row.get("content")
+        else:
+            role, content = row[0], row[1]
+        if role and content:
+            messages.append({"role": role, "content": content})
+
     messages.append({"role": "user", "content": recognized_text})
 
     # 4. Получаем ответ AI
     ai_response = None
     async with aiohttp.ClientSession() as session:
-        for provider in AI_PROVIDERS:
+        # Тот же порядок провайдеров, что и в текстовом чате
+        # (router.ai_router.get_provider_order), иначе голос и текст
+        # ходят к разным моделям.
+        for provider in get_provider_order():
             try:
                 ai_response = await ai_ask_fn(session, provider, messages)
                 break
@@ -187,4 +201,4 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
     except Exception as e:
         log.error(f"[voice] send voice error: {e}")
         # Fallback — текстом
-        await message.answer(ai_response)
+        await message.answer(ai_respons
