@@ -185,6 +185,24 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id, id)"
         )
 
+        # Лог обращений к AI-провайдерам (для /status и /stats): каждая
+        # попытка ask_provider() внутри router.ai_router.ask() пишет сюда
+        # успех или ошибку. Без этого нельзя ответить, кто реально отвечал
+        # и какой провайдер чаще падает — раньше это было видно только
+        # в логах Render.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS provider_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                success INTEGER NOT NULL,
+                error TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_provider_log_created_at ON provider_log(created_at)"
+        )
+
         # WAL: читатели не блокируют писателя. Бот открывает соединение на
         # каждый запрос, и при нескольких активных чатах в обычном режиме
         # journal ловятся "database is locked".
@@ -876,3 +894,106 @@ async def get_player_stats(user_id):
             "role_doctor_count": row[4],
             "role_civilian_count": row[5],
         }
+
+
+async def log_provider_attempt(provider, success, error=None):
+    """
+    Записывает одну попытку обращения к AI-провайдеру (успех/ошибка).
+    Вызывается из router.ai_router.ask() на каждую попытку — используется
+    командами /status (кто отвечал последним) и /stats (кто чаще падает).
+    Ошибка записи в лог не должна ронять сам ответ пользователю, поэтому
+    вызывающий код оборачивает это в try/except.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT INTO provider_log (provider, success, error) VALUES (?, ?, ?)",
+            (provider, 1 if success else 0, error),
+        )
+        await db.commit()
+
+
+async def get_last_successful_provider():
+    """
+    Возвращает (provider, created_at) последнего успешного ответа AI,
+    либо None, если провайдеры ещё ни разу не отвечали.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT provider, created_at FROM provider_log
+            WHERE success = 1
+            ORDER BY id DESC LIMIT 1
+            """
+        )
+        row = await cursor.fetchone()
+        return (row[0], row[1]) if row else None
+
+
+async def get_provider_stats(hours=24):
+    """
+    Возвращает список dict {provider, total, failed} за последние `hours`
+    часов, отсортированный по числу ошибок по убыванию — используется в
+    /stats, чтобы увидеть, какой провайдер чаще падает.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT provider,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failed
+            FROM provider_log
+            WHERE created_at >= datetime('now', ?)
+            GROUP BY provider
+            ORDER BY failed DESC, total DESC
+            """,
+            (f"-{hours} hours",),
+        )
+        rows = await cursor.fetchall()
+        return [
+            {"provider": r[0], "total": r[1], "failed": r[2]}
+            for r in rows
+        ]
+
+
+async def get_total_users_count():
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT COUNT(*) FROM users")
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_active_users_count(hours=24):
+    """Число уникальных пользователей, написавших сообщение за последние `hours` часов."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT COUNT(DISTINCT user_id) FROM messages
+            WHERE role = 'user' AND created_at >= datetime('now', ?)
+            """,
+            (f"-{hours} hours",),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def get_total_messages_count(hours=None):
+    """
+    Общее число сообщений (role='user'). Если передан `hours` — только
+    за последние `hours` часов, иначе за всё время.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        if hours is None:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM messages WHERE role = 'user'"
+            )
+            row = await cursor.fetchone()
+        else:
+            cursor = await db.execute(
+                """
+                SELECT COUNT(*) FROM messages
+                WHERE role = 'user' AND created_at >= datetime('now', ?)
+                """,
+                (f"-{hours} hours",),
+            )
+            row = await cursor.fetchone()
+        return row[0] if row else 0
