@@ -245,7 +245,7 @@ async def _send_night_action_keyboard(bot, game_id, phase_number, actor_row, pla
             label += " (себя)"
         keyboard.add(
             types.InlineKeyboardButton(
-                text=label,
+                text=f"☆ {label}",
                 callback_data=f"game_night:{game_id}:{phase_number}:{action_type}:{target_user_id}",
             )
         )
@@ -277,13 +277,13 @@ async def _build_voting_keyboard(game_id, players):
         _pid, user_id, telegram_id, username, _role, _alive = p
         keyboard.add(
             types.InlineKeyboardButton(
-                text=_display_name(username, telegram_id),
+                text=f"☆ {_display_name(username, telegram_id)}",
                 callback_data=f"game_vote:{game_id}:{user_id}",
             )
         )
     keyboard.add(
         types.InlineKeyboardButton(
-            text="🤷 Пропустить голос",
+            text="☆ 🤷 Пропустить голос",
             callback_data=f"game_vote:{game_id}:{SKIP_TARGET_ID}",
         )
     )
