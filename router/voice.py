@@ -7,10 +7,6 @@
   3. router/ai_router.ask() → ответ Каспера
   4. gTTS → синтез речи .mp3 (TTS)
   5. Отправить voice note в чат
-
-Зависимости (добавить в requirements.txt):
-  gTTS==2.5.3
-  pydub==0.25.1   # конвертация ogg→mp3 для Whisper, если нужно
 """
 
 import os
@@ -34,7 +30,6 @@ async def download_voice(bot, file_id: str) -> bytes:
     file = await bot.get_file(file_id)
     file_path = file.file_path
 
-    # Строим URL для скачивания файла
     token = bot._token  # aiogram 2.x
     url = f"https://api.telegram.org/file/bot{token}/{file_path}"
 
@@ -96,15 +91,6 @@ def synthesize_speech(text: str, lang: str = "ru") -> bytes:
 async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_message_fn, user_id, chat_id=None):
     """
     Полный цикл обработки голосового сообщения.
-
-    Параметры:
-        bot           — объект aiogram Bot
-        message       — объект aiogram Message
-        ai_ask_fn     — функция ask() из ai_router (session, provider, messages)
-        get_history_fn — функция get_history() из db
-        save_message_fn — функция save_message() из db
-        user_id       — ID пользователя в БД
-        chat_id       — ID чата (для групп) или None (для личек)
     """
     # 1. Скачиваем голосовое
     voice = message.voice
@@ -129,7 +115,6 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
 
     log.info(f"[voice] recognized: {recognized_text!r}")
 
-    # Показываем что распознали (удобно для дебага и пользователю приятно)
     await message.answer(f"🎙 *Распознал:* {recognized_text}", parse_mode="Markdown")
 
     # 3. Сохраняем в историю как обычное сообщение
@@ -189,7 +174,6 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
         mp3_bytes = synthesize_speech(ai_response)
     except Exception as e:
         log.error(f"[voice] TTS error: {e}")
-        # Если TTS упал — отвечаем текстом
         await message.answer(ai_response)
         return
 
@@ -200,5 +184,12 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
         await message.answer_voice(voice_file)
     except Exception as e:
         log.error(f"[voice] send voice error: {e}")
-        # Fallback — текстом
-        await message.answer(ai_respons
+        await message.answer(ai_response)
+
+
+# ---------------------------------------------------------------------------
+# КОНЕЦ ФАЙЛА router/voice.py
+# Ниже кода нет. Эти строки — комментарии-подушка: если при копировании
+# в GitHub с телефона обрежется самый хвост файла, пострадают только они,
+# а рабочий код выше останется целым.
+# ---------------------------------------------------------------------------
