@@ -10,3 +10,10 @@ __pycache__/
 data/music_cache/
 generated_sites/
 venv/
+
+# базы данных не должны попадать в репозиторий:
+# в data/kasper.db лежат реальные сообщения пользователей
+*.db
+*.sqlite
+*.sqlite3
+data/
