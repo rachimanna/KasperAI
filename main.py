@@ -83,6 +83,7 @@ async def on_startup(dp):
         BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
+        BotCommand("gamestats", "Моя статистика «Теневого города»"),
     ])
 
     # Админские команды показываем в подсказках только самим админам —
@@ -94,6 +95,7 @@ async def on_startup(dp):
         BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
+        BotCommand("gamestats", "Моя статистика «Теневого города»"),
         BotCommand("ban", "Забанить пользователя (ответом/@username/id)"),
         BotCommand("unban", "Разбанить пользователя (ответом/@username/id)"),
         BotCommand("broadcast", "Рассылка всем пользователям"),
