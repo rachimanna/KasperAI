@@ -141,6 +141,26 @@ async def init_db():
             )
         """)
 
+        # Агрегированная статистика игрока по игре "Теневой город" — одна
+        # строка на пользователя, обновляется по факту завершения игры
+        # (см. record_game_result). Отдельная таблица, а не подсчёт по
+        # game_players на лету, потому что она нужна часто (команда
+        # /gamestats) и не должна пересчитываться каждый раз со сканом
+        # всех прошлых игр пользователя.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS player_stats (
+                user_id INTEGER PRIMARY KEY,
+                games_played INTEGER NOT NULL DEFAULT 0,
+                games_won INTEGER NOT NULL DEFAULT 0,
+                role_shadow_count INTEGER NOT NULL DEFAULT 0,
+                role_detective_count INTEGER NOT NULL DEFAULT 0,
+                role_doctor_count INTEGER NOT NULL DEFAULT 0,
+                role_civilian_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
         await db.commit()
 
 
@@ -748,3 +768,73 @@ async def get_actions_by_type(game_id, phase_number, action_type):
             (game_id, phase_number, action_type),
         )
         return await cursor.fetchall()
+
+
+_ROLE_STATS_COLUMN = {
+    "shadow": "role_shadow_count",
+    "detective": "role_detective_count",
+    "doctor": "role_doctor_count",
+    "civilian": "role_civilian_count",
+}
+
+
+async def record_player_game_result(user_id, role, won):
+    """
+    Обновляет агрегированную статистику одного игрока после завершения
+    партии: +1 к сыгранным играм, +1 к победам (если won=True), и +1 к
+    счётчику той роли, в которой он играл. INSERT OR IGNORE создаёт
+    строку при первой игре пользователя, затем UPDATE инкрементирует —
+    без этого UPDATE на несуществующей строке молча ничего не изменит.
+    """
+    role_column = _ROLE_STATS_COLUMN.get(role)
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO player_stats (user_id) VALUES (?)",
+            (user_id,),
+        )
+
+        set_clauses = [
+            "games_played = games_played + 1",
+            "games_won = games_won + ?",
+            "updated_at = CURRENT_TIMESTAMP",
+        ]
+        params = [1 if won else 0]
+
+        if role_column:
+            set_clauses.append(f"{role_column} = {role_column} + 1")
+
+        params.append(user_id)
+
+        await db.execute(
+            f"UPDATE player_stats SET {', '.join(set_clauses)} WHERE user_id = ?",
+            params,
+        )
+        await db.commit()
+
+
+async def get_player_stats(user_id):
+    """
+    Возвращает dict со статистикой игрока, либо None, если он ещё ни разу
+    не доигрывал партию "Теневой город" до конца.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            """
+            SELECT games_played, games_won, role_shadow_count,
+                   role_detective_count, role_doctor_count, role_civilian_count
+            FROM player_stats WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "games_played": row[0],
+            "games_won": row[1],
+            "role_shadow_count": row[2],
+            "role_detective_count": row[3],
+            "role_doctor_count": row[4],
+            "role_civilian_count": row[5],
+        }
