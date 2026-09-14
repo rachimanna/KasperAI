@@ -518,6 +518,56 @@ async def cmd_limit(message: types.Message):
     await message.answer(text)
 
 
+ROLE_STATS_LABELS = {
+    "role_shadow_count": ("🕶", "Тень"),
+    "role_detective_count": ("🔍", "Детектив"),
+    "role_doctor_count": ("💊", "Доктор"),
+    "role_civilian_count": ("👤", "Мирный житель"),
+}
+
+
+async def cmd_gamestats(message: types.Message):
+    from database.db import get_player_stats
+
+    user_id = await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
+    stats = await get_player_stats(user_id)
+
+    if not stats or stats["games_played"] == 0:
+        await message.answer(
+            "☆ 📊 <b>Статистика «Теневого города»</b>\n\n"
+            "Пока пусто — ни одной доигранной партии. Сначала сыграй "
+            "хотя бы раз через /shadowcity, потом и похвастаться будет чем.",
+            parse_mode="HTML",
+        )
+        return
+
+    games_played = stats["games_played"]
+    games_won = stats["games_won"]
+    win_rate = round(games_won / games_played * 100) if games_played else 0
+
+    role_lines = []
+    for column, (icon, label) in ROLE_STATS_LABELS.items():
+        count = stats.get(column, 0)
+        if count:
+            role_lines.append(f"{icon} {label}: {count}")
+
+    lines = [
+        "☆ 📊 <b>Статистика «Теневого города»</b>",
+        "",
+        f"🎮 Сыграно партий: {games_played}",
+        f"🏆 Побед: {games_won} ({win_rate}%)",
+    ]
+    if role_lines:
+        lines.append("")
+        lines.append("🎭 <b>Роли:</b>")
+        lines.extend(role_lines)
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
 async def handle_new_chat_members(message: types.Message):
     bot_info = await message.bot.get_me()
 
@@ -1520,6 +1570,10 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         cmd_limit,
         commands=["limit"],
+    )
+    dp.register_message_handler(
+        cmd_gamestats,
+        commands=["gamestats"],
     )
     dp.register_message_handler(
         cmd_game,
