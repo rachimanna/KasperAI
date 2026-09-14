@@ -588,10 +588,14 @@ async def handle_message(message: types.Message):
 
             _mark_awaiting_agent_input(agent_user_id)
             await message.answer(
-                "🧠 Похоже, это не задача для агента. Опиши, что нужно "
-                "найти/сравнить/собрать или какой сайт сделать — или просто "
-                "продолжай общаться, я отвечу как обычно."
+                "🧠 Похоже, это не задача для агента. Опиши одним сообщением, "
+                "что нужно найти / сравнить / собрать или какой сайт сделать. "
+                "Если агент больше не нужен — напиши /start и продолжим обычный чат."
             )
+            # ВАЖНО: return обязателен. Без него после этого сообщения
+            # выполнение шло дальше в обычный AI-ответ, пользователь получал
+            # ДВА сообщения подряд и терял один запрос из дневного лимита.
+            return
 
         if not is_group and has_agent_hint(text):
             async with aiohttp.ClientSession() as _detect_session:
@@ -1123,13 +1127,37 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
         username=telegram_user.username,
     )
 
-    if not await is_player_in_game(game_id, voter_user_id):
+    # Проверяем не только участие в игре, но и что игрок ЖИВ: раньше
+    # выбывшие (убитые ночью или исключённые голосованием) могли и дальше
+    # жать кнопки голосования и решать исход партии.
+    players = await get_game_players(game_id)
+    voter_row = next((p for p in players if p[1] == voter_user_id), None)
+
+    if voter_row is None:
         await callback_query.answer("Ты не участвуешь в этой игре.", show_alert=True)
+        return
+
+    if voter_row[5] != 1:
+        await callback_query.answer(
+            "Ты уже выбыл(а) из игры — голосовать нельзя 💀", show_alert=True
+        )
         return
 
     if target_user_id == voter_user_id:
         await callback_query.answer("Нельзя голосовать за самого себя 🙅", show_alert=True)
         return
+
+    # Голосовать можно только за живого игрока (кнопки строятся по живым,
+    # но старое сообщение с кнопками могло остаться в чате выше).
+    if target_user_id != SKIP_TARGET_ID:
+        target_alive = next(
+            (p for p in players if p[1] == target_user_id and p[5] == 1), None
+        )
+        if target_alive is None:
+            await callback_query.answer(
+                "Этот игрок уже выбыл — выбери другого.", show_alert=True
+            )
+            return
 
     await handle_vote_action(game_id, phase_number, voter_user_id, target_user_id)
     await callback_query.answer("Голос учтён ✅")
@@ -1138,7 +1166,6 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
     if target_user_id == SKIP_TARGET_ID:
         announce = f"🗳 {voter_name} решил(а) пропустить голос."
     else:
-        players = await get_game_players(game_id)
         target_row = next((p for p in players if p[1] == target_user_id), None)
         if target_row:
             _pid, _uid, target_telegram_id, target_username, _role, _alive = target_row
