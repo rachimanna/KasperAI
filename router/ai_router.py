@@ -402,6 +402,8 @@ async def ask(messages):
                 messages,
             )
 
+            await _safe_log_provider_attempt(provider, True)
+
             return {
                 "provider": provider,
                 "answer": answer,
@@ -415,6 +417,8 @@ async def ask(messages):
                 f"[{provider}] ERROR: {error}",
                 flush=True,
             )
+
+            await _safe_log_provider_attempt(provider, False, error)
 
             errors.append(
                 {
@@ -430,6 +434,20 @@ async def ask(messages):
             ensure_ascii=False,
         )
     )
+
+
+async def _safe_log_provider_attempt(provider, success, error=None):
+    """
+    Пишет попытку обращения к провайдеру в БД для /status и /stats.
+    Импорт внутри функции — чтобы не создавать цикл импортов на уровне
+    модуля (database.db не должен зависеть от router на старте). Ошибка
+    самого лога не должна портить ответ пользователю, поэтому глушится.
+    """
+    try:
+        from database.db import log_provider_attempt
+        await log_provider_attempt(provider, success, error)
+    except Exception as log_error:
+        print(f"[provider_log] write error: {log_error}", flush=True)
 
 
 async def should_search_web(session, provider, user_text):
