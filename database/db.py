@@ -161,6 +161,38 @@ async def init_db():
             )
         """)
 
+        # Дневные лимиты запросов. РАНЬШЕ эта таблица создавалась только
+        # внутри check_and_increment_limit(), поэтому get_limit_status()
+        # (команда /limit) на свежей базе падала с "no such table:
+        # usage_limits". Теперь она есть сразу после init_db.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS usage_limits (
+                user_id INTEGER PRIMARY KEY,
+                request_count INTEGER DEFAULT 0,
+                last_date TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
+        # Индексы под реальные запросы истории: get_history и
+        # get_messages_after всегда фильтруют по chat_id или user_id и
+        # сортируют по id. Без индексов каждое сообщение бота = полный
+        # скан таблицы messages, и чем дольше живёт бот, тем медленнее.
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_user_id ON messages(user_id, id)"
+        )
+
+        # WAL: читатели не блокируют писателя. Бот открывает соединение на
+        # каждый запрос, и при нескольких активных чатах в обычном режиме
+        # journal ловятся "database is locked".
+        try:
+            await db.execute("PRAGMA journal_mode=WAL")
+        except Exception as e:
+            print(f"[db] WAL enable error (non-fatal): {e}", flush=True)
+
         await db.commit()
 
 
@@ -453,7 +485,15 @@ async def get_user_api_key(user_id):
         return row if row else (None, None)
 
 
-ADMIN_TELEGRAM_IDS = {8957436007}
+# Админы берутся ТОЛЬКО из переменных окружения (config/settings.py читает
+# ADMIN_ID / ADMIN_IDS). Раньше здесь стоял захардкоженный id, из-за чего
+# безлимит по запросам и права на /ban /unban /broadcast могли расходиться:
+# один список в коде, другой в env. Теперь источник истины один.
+# ВАЖНО: на Render в Environment должна быть переменная ADMIN_ID со твоим
+# telegram_id, иначе безлимита не будет ни у кого.
+from config.settings import ADMIN_IDS as _ADMIN_IDS
+
+ADMIN_TELEGRAM_IDS = set(_ADMIN_IDS)
 
 
 async def get_limit_status(user_id, daily_limit=20):
@@ -462,11 +502,17 @@ async def get_limit_status(user_id, daily_limit=20):
     today = str(date.today())
 
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute(
-            "SELECT request_count, last_date FROM usage_limits WHERE user_id = ?",
-            (user_id,),
-        )
-        row = await cursor.fetchone()
+        # Страховка: если бот почему-то запустился без init_db (или база
+        # подменена), /limit всё равно не должен падать с ошибкой.
+        try:
+            cursor = await db.execute(
+                "SELECT request_count, last_date FROM usage_limits WHERE user_id = ?",
+                (user_id,),
+            )
+            row = await cursor.fetchone()
+        except Exception as e:
+            print(f"[db] get_limit_status error: {e}", flush=True)
+            return 0, daily_limit
 
         if row is None:
             return 0, daily_limit
@@ -493,16 +539,8 @@ async def check_and_increment_limit(user_id, daily_limit=20, telegram_id=None):
     today = str(date.today())
 
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS usage_limits (
-                user_id INTEGER PRIMARY KEY,
-                request_count INTEGER DEFAULT 0,
-                last_date TEXT,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        """)
-        await db.commit()
-
+        # CREATE TABLE отсюда убран: таблица создаётся один раз в init_db.
+        # Раньше DDL выполнялся на КАЖДОЕ сообщение любого пользователя.
         cursor = await db.execute(
             "SELECT request_count, last_date FROM usage_limits WHERE user_id = ?",
             (user_id,),
