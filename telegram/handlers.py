@@ -963,10 +963,15 @@ async def handle_message(message: types.Message):
             await message.answer(error_text)
 
 MIN_GAME_PLAYERS = 4
+MAX_GAME_PLAYERS = 10
 
-def _build_lobby_keyboard(bot_username, players_count, max_players=10):
+def _build_lobby_keyboard(bot_username, players_count, max_players=MAX_GAME_PLAYERS):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(types.InlineKeyboardButton(text="☆ 🚀 Присоединиться", callback_data="game_join"))
+    # Кнопка ручного старта видна только когда набрался минимум игроков,
+    # но лобби ещё не заполнено до максимума (иначе игра стартует сама).
+    if players_count >= MIN_GAME_PLAYERS and players_count < max_players:
+        keyboard.add(types.InlineKeyboardButton(text="▶️ Начать игру", callback_data="game_start"))
     keyboard.add(types.InlineKeyboardButton(text="☆ 🛑 Остановить", callback_data="game_stop"))
     return keyboard
 
@@ -1068,7 +1073,10 @@ async def handle_game_join(callback_query: types.CallbackQuery):
         return
 
     players = await get_game_players(game_id)
-    if len(players) >= MIN_GAME_PLAYERS:
+
+    # Автостарт только когда лобби реально заполнено до предела —
+    # до этого ждём остальных или ручного старта кнопкой "Начать игру".
+    if len(players) >= MAX_GAME_PLAYERS:
         try:
             await callback_query.message.edit_text(
                 "🎮 Игра началась! Роли разосланы в личные сообщения.",
@@ -1076,7 +1084,7 @@ async def handle_game_join(callback_query: types.CallbackQuery):
         except Exception as e:
             print(f"[game] lobby auto-start edit ERROR: {e}", flush=True)
 
-        await callback_query.answer("Игра началась! Проверь личные сообщения от бота 📩", show_alert=True)
+        await callback_query.answer("Лобби заполнено — игра началась! Проверь личные сообщения от бота 📩", show_alert=True)
         await start_game(callback_query.bot, game_id, chat_id)
         return
 
@@ -1087,6 +1095,35 @@ async def handle_game_join(callback_query: types.CallbackQuery):
     except Exception as e:
         print(f"[game] lobby edit ERROR: {e}", flush=True)
     await callback_query.answer("Ты в игре! 🎮")
+
+
+async def handle_game_start(callback_query: types.CallbackQuery):
+    chat_id = callback_query.message.chat.id
+    game = await get_active_game(chat_id)
+
+    if not game or game[2] != "lobby":
+        await callback_query.answer("Сейчас нельзя начать — игра уже началась или её нет.", show_alert=True)
+        return
+
+    game_id = game[0]
+    players = await get_game_players(game_id)
+
+    if len(players) < MIN_GAME_PLAYERS:
+        await callback_query.answer(
+            f"Нужно минимум {MIN_GAME_PLAYERS} игрока, сейчас {len(players)}.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        await callback_query.message.edit_text(
+            "🎮 Игра началась! Роли разосланы в личные сообщения.",
+        )
+    except Exception as e:
+        print(f"[game] lobby manual-start edit ERROR: {e}", flush=True)
+
+    await callback_query.answer("Игра началась! Проверь личные сообщения от бота 📩", show_alert=True)
+    await start_game(callback_query.bot, game_id, chat_id)
 
 async def handle_game_night_action(callback_query: types.CallbackQuery):
     _, game_id, phase_number, action_type, target_user_id = callback_query.data.split(":")
@@ -1381,8 +1418,6 @@ async def handle_voice(message: types.Message):
         chat_id=chat_id,
     )
 
-MIN_GAME_PLAYERS = 4
-
 def register_handlers(dp: Dispatcher):
     dp.middleware.setup(BanCheckMiddleware())
     dp.middleware.setup(BusinessDiagnosticMiddleware())
@@ -1403,6 +1438,7 @@ def register_handlers(dp: Dispatcher):
     dp.register_callback_query_handler(handle_agent_stop, lambda c: c.data == "agent_stop")
     dp.register_callback_query_handler(handle_game_join, lambda c: c.data == "game_join")
     dp.register_callback_query_handler(handle_game_stop, lambda c: c.data == "game_stop")
+    dp.register_callback_query_handler(handle_game_start, lambda c: c.data == "game_start")
     dp.register_callback_query_handler(
         handle_game_night_action,
         lambda c: c.data and c.data.startswith("game_night:"),
