@@ -66,6 +66,7 @@ from router.agent import (
     TASK_TIMEOUT_SECONDS,
 )
 from router.agent_ui import plan_confirmation_keyboard, stop_keyboard
+from router.voice import handle_voice_message
 import aiohttp
 
 TRIGGER_PATTERN = re.compile(r"каспер|kasper", re.IGNORECASE)
@@ -1555,6 +1556,45 @@ async def cmd_broadcast(message: types.Message):
         pass
 
 
+async def handle_voice(message: types.Message):
+    """Обработчик голосовых сообщений — STT → AI → TTS."""
+    is_group = message.chat.type in ("group", "supergroup")
+
+    # В группе реагируем только если бот упомянут или ответ боту
+    if is_group:
+        is_reply_to_bot = False
+        if message.reply_to_message:
+            bot_info = await message.bot.get_me()
+            if message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_info.id:
+                is_reply_to_bot = True
+        if not is_reply_to_bot:
+            return
+
+    user_id = await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
+
+    allowed, remaining = await check_and_increment_limit(
+        user_id, daily_limit=20, telegram_id=message.from_user.id
+    )
+    if not allowed:
+        await message.answer("⛔ Лимит исчерпан, ждите сброса.")
+        return
+
+    chat_id = message.chat.id if is_group else None
+
+    await handle_voice_message(
+        bot=message.bot,
+        message=message,
+        ai_ask_fn=ask_provider,
+        get_history_fn=get_history,
+        save_message_fn=save_message,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+
+
 def register_handlers(dp: Dispatcher):
     dp.middleware.setup(BanCheckMiddleware())
     dp.middleware.setup(BusinessDiagnosticMiddleware())
@@ -1634,6 +1674,10 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         handle_new_chat_members,
         content_types=types.ContentTypes.NEW_CHAT_MEMBERS,
+    )
+    dp.register_message_handler(
+        handle_voice,
+        content_types=types.ContentTypes.VOICE,
     )
     dp.register_message_handler(
         handle_message,
