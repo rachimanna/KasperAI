@@ -1,4 +1,5 @@
 import asyncio
+import random
 import re
 import time
 
@@ -450,16 +451,46 @@ WELCOME_PROMPT = (
 )
 
 
+START_GREETINGS = [
+    "Ну здравствуй. Я Kasper AI, меня сделали разработчики Kasper AI. "
+    "Спрашивай, так уж и быть, отвечу — но без сюсюканья, я не такой. 😏",
+
+    "О, ты нашёл кнопку /start, поздравляю. Я Kasper AI, буду с тобой "
+    "переписываться, пока не надоем друг другу. Спрашивай.",
+
+    "Явился. Ладно, раз пришёл — я Kasper AI, умею почти всё, "
+    "притворяюсь, что мне не лень. Погнали.",
+
+    "Ты у Kasper AI. Готов помогать — не потому что добрый, а потому что "
+    "не умею иначе. Задавай вопрос.",
+
+    "Приветик, чё как. Шучу, я не такой. Я Kasper AI, спрашивай по делу — "
+    "болтовню тоже переживу, но не обещаю восторга.",
+
+    "Так, новый диалог. Я Kasper AI, отвечу почти на что угодно, если не "
+    "заставишь меня скучать первым сообщением.",
+
+    "Ну вот и снова я — Kasper AI. Не благодари заранее, сначала спроси "
+    "что-нибудь стоящее.",
+
+    "Здарова. Я Kasper AI, могу найти, сравнить, сделать сайт, ответить "
+    "на вопрос — короче, всё, что тебе лень делать самому.",
+
+    "О, кто-то решил пообщаться с ИИ вместо того, чтобы читать гугл. "
+    "Разумный выбор. Я Kasper AI, слушаю.",
+
+    "Запустил меня — молодец, не всякий разберётся с кнопкой /start. "
+    "Я Kasper AI, давай уже вопрос.",
+]
+
+
 async def cmd_start(message: types.Message):
     await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
     )
 
-    await message.answer(
-        "Ну здравствуй. Я Kasper AI, меня сделали разработчики Kasper AI. "
-        "Спрашивай, так уж и быть, отвечу — но без сюсюканья, я не такой. 😏"
-    )
+    await message.answer(random.choice(START_GREETINGS))
 
 
 async def cmd_help(message: types.Message):
@@ -1043,13 +1074,13 @@ def _build_lobby_keyboard(bot_username, players_count, max_players=10):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         types.InlineKeyboardButton(
-            text="🚀 Присоединиться",
+            text="☆ 🚀 Присоединиться",
             callback_data="game_join",
         )
     )
     keyboard.add(
         types.InlineKeyboardButton(
-            text="🛑 Остановить",
+            text="☆ 🛑 Остановить",
             callback_data="game_stop",
         ),
     )
