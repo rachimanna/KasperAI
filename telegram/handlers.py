@@ -67,6 +67,7 @@ from router.agent import (
 )
 from router.agent_ui import plan_confirmation_keyboard, stop_keyboard
 from router.voice import handle_voice_message
+from router.osint import run_osint
 import aiohttp
 
 TRIGGER_PATTERN = re.compile(r"каспер|kasper", re.IGNORECASE)
@@ -625,6 +626,9 @@ async def _animate_kasper(message):
 
 
 async def handle_message(message: types.Message):
+    if await handle_osint_query(message):
+        return
+
     is_group = message.chat.type in ("group", "supergroup")
     text = (message.text or "").strip()
     if not text:
@@ -1595,6 +1599,59 @@ async def handle_voice(message: types.Message):
     )
 
 
+
+# --- OSINT FSM (in-memory, per telegram user) ---
+_OSINT_AWAIT: dict = {}
+
+
+async def cmd_osint(message: types.Message):
+    """
+    /osint — пробив по @username / телефону / telegram id.
+    Данные из локального дампа data/osint_dump.db (если есть) + публичный TG.
+    """
+    await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) >= 2 and parts[1].strip():
+        await message.answer("⏳ Ищу…")
+        report = await run_osint(parts[1].strip())
+        await message.answer(report, parse_mode="HTML", disable_web_page_preview=True)
+        return
+
+    _OSINT_AWAIT[message.from_user.id] = True
+    await message.answer(
+        "🔍 <b>OSINT</b>\n\n"
+        "Пришли одним сообщением:\n"
+        "• <code>@username</code>\n"
+        "• телефон <code>+79001234567</code>\n"
+        "• или numeric <code>telegram_id</code>\n\n"
+        "Отмена: /cancel",
+        parse_mode="HTML",
+    )
+
+
+async def cmd_cancel(message: types.Message):
+    _OSINT_AWAIT.pop(message.from_user.id, None)
+    await message.answer("Ок, отменил.")
+
+
+async def handle_osint_query(message: types.Message):
+    """Ловит следующий текст после /osint, если ждём запрос."""
+    if message.from_user.id not in _OSINT_AWAIT:
+        return False
+    _OSINT_AWAIT.pop(message.from_user.id, None)
+    q = (message.text or "").strip()
+    if not q or q.startswith("/"):
+        await message.answer("Пусто. Снова /osint")
+        return True
+    await message.answer("⏳ Ищу…")
+    report = await run_osint(q)
+    await message.answer(report, parse_mode="HTML", disable_web_page_preview=True)
+    return True
+
+
 def register_handlers(dp: Dispatcher):
     dp.middleware.setup(BanCheckMiddleware())
     dp.middleware.setup(BusinessDiagnosticMiddleware())
@@ -1639,6 +1696,15 @@ def register_handlers(dp: Dispatcher):
         cmd_agent,
         commands=["agent"],
     )
+    dp.register_message_handler(
+        cmd_osint,
+        commands=["osint"],
+    )
+    dp.register_message_handler(
+        cmd_cancel,
+        commands=["cancel"],
+    )
+
     dp.register_callback_query_handler(
         handle_agent_confirm,
         lambda c: c.data == "agent_confirm",
