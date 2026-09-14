@@ -69,8 +69,7 @@ async def on_startup(dp):
 
     from aiogram.types import BotCommand, BotCommandScopeChat
 
-    # Полностью очищаем старые команды Telegram,
-    # включая оставшийся /osint в меню.
+    # Полностью очищаем старые команды Telegram.
     try:
         await dp.bot.delete_my_commands()
     except Exception as e:
@@ -81,7 +80,6 @@ async def on_startup(dp):
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
         BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
-        BotCommand("osint", "Пробив: @user / телефон / id"),
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
         BotCommand("gamestats", "Моя статистика «Теневого города»"),
@@ -94,7 +92,6 @@ async def on_startup(dp):
         BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
         BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
-        BotCommand("osint", "Пробив: @user / телефон / id"),
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
         BotCommand("gamestats", "Моя статистика «Теневого города»"),
