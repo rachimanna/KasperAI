@@ -67,20 +67,16 @@ from router.agent import (
 )
 from router.agent_ui import plan_confirmation_keyboard, stop_keyboard
 from router.voice import handle_voice_message
-from router.osint import run_osint
 import aiohttp
 
 TRIGGER_PATTERN = re.compile(r"каспер|kasper", re.IGNORECASE)
 
-# Обычные сообщения не требуют отдельного AI-запроса классификатору.
-# Это экономит один сетевой запрос и заметно ускоряет стандартные ответы.
 FAST_CLASSIFY_PATTERN = re.compile(
     r"\b(скач|скача|музык|песн|трек|включи|сделай сайт|создай сайт|лендинг|портфолио|"
     r"новост|погод|курс валют|курс доллара|курс евро|цена|стоимость|актуальн|"
     r"сейчас|сегодня|вчера|завтра|последн|найди|поищи|расписани|матч|событи)\w*",
     re.IGNORECASE,
 )
-
 
 WEB_FAST_PATTERN = re.compile(
     r"\b("
@@ -97,45 +93,26 @@ WEB_FAST_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-
 def needs_fast_web_search(text: str) -> bool:
     return bool(WEB_FAST_PATTERN.search(text))
-
 
 def needs_smart_classification(text: str) -> bool:
     return bool(FAST_CLASSIFY_PATTERN.search(text))
 
 PENDING_SITE_REQUESTS = {}
-
-# Пользователи, у которых сейчас открыт диалог "уточни задачу для агента"
-# (после /agent без текста или нажатия "✏️ Изменить"). Ожидаем следующее
-# текстовое сообщение как задачу/правку для агента, а не обычный вопрос
-# Касперу. Значение — unix-время истечения ожидания: если пользователь
-# забыл, что вызывал /agent, и просто продолжил обычный разговор через
-# несколько минут, это не должно неожиданно утянуть сообщение в агента.
 AGENT_AWAITING_EDIT = {}
 AGENT_AWAITING_EDIT_TTL_SECONDS = 180
-
 
 def _mark_awaiting_agent_input(user_id: int):
     AGENT_AWAITING_EDIT[user_id] = time.time() + AGENT_AWAITING_EDIT_TTL_SECONDS
 
-
 def _pop_awaiting_agent_input(user_id: int) -> bool:
-    """True, если пользователь реально ожидался и ожидание не истекло."""
     expires_at = AGENT_AWAITING_EDIT.pop(user_id, None)
     if expires_at is None:
         return False
     return time.time() < expires_at
 
-
 async def _start_agent_flow(message: types.Message, user_id: int, task_text: str):
-    """
-    Общая точка входа в агент-режим — вызывается и из команды /agent, и из
-    автодетекции в handle_message. Строит план и показывает его с кнопками
-    подтверждения. Любая ошибка здесь ловится вызывающим кодом — при сбое
-    агент-режим просто сообщает об ошибке, не трогая обычный чат.
-    """
     allowed, remaining = check_and_increment_agent_limit(user_id)
     if not allowed:
         await message.answer(
@@ -178,7 +155,6 @@ async def _start_agent_flow(message: types.Message, user_id: int, task_text: str
             reply_markup=plan_confirmation_keyboard(),
         )
 
-
 async def cmd_agent(message: types.Message):
     if message.chat.type in ("group", "supergroup"):
         await message.answer(
@@ -204,13 +180,7 @@ async def cmd_agent(message: types.Message):
     task_text = parts[1].strip()
     await _start_agent_flow(message, user_id, task_text)
 
-
 async def _run_agent_plan(bot, chat_id: int, user_id: int):
-    """
-    Выполняет подтверждённый план по шагам, показывая живой прогресс в
-    одном редактируемом сообщении. Вызывается из callback-хендлера
-    agent_confirm, после того как пользователь нажал "✅ Выполнить".
-    """
     session_data = AGENT_SESSIONS.get(user_id)
     if not session_data:
         return
@@ -233,7 +203,7 @@ async def _run_agent_plan(bot, chat_id: int, user_id: int):
         async with aiohttp.ClientSession() as agent_session:
             for index, step in enumerate(plan["steps"]):
                 if AGENT_SESSIONS.get(user_id, {}).get("status") != "running":
-                    return  # остановлено пользователем через agent_stop
+                    return
 
                 try:
                     await progress_message.edit_text(
@@ -313,7 +283,6 @@ async def _run_agent_plan(bot, chat_id: int, user_id: int):
 
     AGENT_SESSIONS.pop(user_id, None)
 
-
 async def handle_agent_confirm(callback_query: types.CallbackQuery):
     user_id = await get_or_create_user(
         telegram_id=callback_query.from_user.id,
@@ -334,7 +303,6 @@ async def handle_agent_confirm(callback_query: types.CallbackQuery):
         _run_agent_plan(callback_query.bot, callback_query.message.chat.id, user_id)
     )
 
-
 async def handle_agent_cancel(callback_query: types.CallbackQuery):
     user_id = await get_or_create_user(
         telegram_id=callback_query.from_user.id,
@@ -347,7 +315,6 @@ async def handle_agent_cancel(callback_query: types.CallbackQuery):
         await callback_query.message.edit_text("❌ Задача для агента отменена.")
     except Exception:
         pass
-
 
 async def handle_agent_edit(callback_query: types.CallbackQuery):
     user_id = await get_or_create_user(
@@ -369,7 +336,6 @@ async def handle_agent_edit(callback_query: types.CallbackQuery):
         "✏️ Опиши, что изменить в задаче — построю план заново."
     )
 
-
 async def handle_agent_stop(callback_query: types.CallbackQuery):
     user_id = await get_or_create_user(
         telegram_id=callback_query.from_user.id,
@@ -384,18 +350,9 @@ async def handle_agent_stop(callback_query: types.CallbackQuery):
     except Exception:
         pass
 
-# Через сколько новых сообщений после последней сумморизации запускать
-# обновление "скользящего" конспекта разговора.
 SUMMARY_TRIGGER_MESSAGE_COUNT = 14
 
-
 async def _maybe_update_conversation_summary(user_id, chat_id):
-    """
-    Фоновая задача: проверяет, накопилось ли достаточно новых сообщений
-    с момента последней сумморизации, и если да — обновляет конспект.
-    Не должна тормозить ответ пользователю, поэтому вызывается через
-    asyncio.create_task и сама ловит все свои ошибки.
-    """
     try:
         previous_summary, last_id = await get_conversation_summary(user_id, chat_id=chat_id)
         new_messages = await get_messages_after(user_id, last_id, chat_id=chat_id)
@@ -452,48 +409,35 @@ WELCOME_PROMPT = (
     "ответ. Без мата и без реальной грубости — это только стиль подачи."
 )
 
-
 START_GREETINGS = [
     "Ну здравствуй. Я Kasper AI, меня сделали разработчики Kasper AI. "
     "Спрашивай, так уж и быть, отвечу — но без сюсюканья, я не такой. 😏",
-
     "О, ты нашёл кнопку /start, поздравляю. Я Kasper AI, буду с тобой "
     "переписываться, пока не надоем друг другу. Спрашивай.",
-
     "Явился. Ладно, раз пришёл — я Kasper AI, умею почти всё, "
     "притворяюсь, что мне не лень. Погнали.",
-
     "Ты у Kasper AI. Готов помогать — не потому что добрый, а потому что "
     "не умею иначе. Задавай вопрос.",
-
     "Приветик, чё как. Шучу, я не такой. Я Kasper AI, спрашивай по делу — "
     "болтовню тоже переживу, но не обещаю восторга.",
-
     "Так, новый диалог. Я Kasper AI, отвечу почти на что угодно, если не "
     "заставишь меня скучать первым сообщением.",
-
     "Ну вот и снова я — Kasper AI. Не благодари заранее, сначала спроси "
     "что-нибудь стоящее.",
-
     "Здарова. Я Kasper AI, могу найти, сравнить, сделать сайт, ответить "
     "на вопрос — короче, всё, что тебе лень делать самому.",
-
     "О, кто-то решил пообщаться с ИИ вместо того, чтобы читать гугл. "
     "Разумный выбор. Я Kasper AI, слушаю.",
-
     "Запустил меня — молодец, не всякий разберётся с кнопкой /start. "
     "Я Kasper AI, давай уже вопрос.",
 ]
-
 
 async def cmd_start(message: types.Message):
     await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
     )
-
     await message.answer(random.choice(START_GREETINGS))
-
 
 async def cmd_help(message: types.Message):
     await message.answer(
@@ -505,7 +449,6 @@ async def cmd_help(message: types.Message):
         "/status — состояние системы"
     )
 
-
 async def cmd_limit(message: types.Message):
     from database.db import ADMIN_TELEGRAM_IDS
     user_id = await get_or_create_user(
@@ -513,12 +456,11 @@ async def cmd_limit(message: types.Message):
         username=message.from_user.username,
     )
     if message.from_user.id in ADMIN_TELEGRAM_IDS:
-        await message.answer("\U0001F451 \u0412\u044b \u0430\u0434\u043c\u0438\u043d \u2014 \u043b\u0438\u043c\u0438\u0442 \u0431\u0435\u0437\u043b\u0438\u043c\u0438\u0442\u043d\u044b\u0439.")
+        await message.answer("👑 Вы админ — лимит безлимитный.")
         return
     used, remaining = await get_limit_status(user_id, daily_limit=20)
-    text = "\U0001F4CA \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u043e \u0441\u0435\u0433\u043e\u0434\u043d\u044f: " + str(used) + "/20" + chr(10) + "\u041e\u0441\u0442\u0430\u043b\u043e\u0441\u044c: " + str(remaining)
+    text = "📊 Использовано сегодня: " + str(used) + "/20" + chr(10) + "Осталось: " + str(remaining)
     await message.answer(text)
-
 
 ROLE_STATS_LABELS = {
     "role_shadow_count": ("🕶", "Тень"),
@@ -527,10 +469,8 @@ ROLE_STATS_LABELS = {
     "role_civilian_count": ("👤", "Мирный житель"),
 }
 
-
 async def cmd_gamestats(message: types.Message):
     from database.db import get_player_stats
-
     user_id = await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
@@ -569,16 +509,9 @@ async def cmd_gamestats(message: types.Message):
 
     await message.answer("\n".join(lines), parse_mode="HTML")
 
-
 async def handle_new_chat_members(message: types.Message):
     bot_info = await message.bot.get_me()
-
-    added_bot = False
-    for member in message.new_chat_members:
-        if member.id == bot_info.id:
-            added_bot = True
-            break
-
+    added_bot = any(member.id == bot_info.id for member in message.new_chat_members)
     if not added_bot:
         return
 
@@ -590,9 +523,7 @@ async def handle_new_chat_members(message: types.Message):
             answer = result[-1]
         else:
             answer = result
-
         answer = str(answer).strip()
-
         if not answer:
             answer = (
                 "👋 Привет! Я Kasper AI — ИИ-помощник. "
@@ -606,9 +537,7 @@ async def handle_new_chat_members(message: types.Message):
             "Обращайтесь ко мне по имени 'Каспер' или 'Kasper', "
             "и я отвечу!"
         )
-
     await message.answer(answer)
-
 
 async def _animate_kasper(message):
     frames = ["✦ Kasper", "✧ Kasper", "· Kasper", "✧ Kasper"]
@@ -624,25 +553,16 @@ async def _animate_kasper(message):
     except asyncio.CancelledError:
         pass
 
-
 async def handle_message(message: types.Message):
-    if await handle_osint_query(message):
-        return
-
     is_group = message.chat.type in ("group", "supergroup")
     text = (message.text or "").strip()
     if not text:
         return
 
-    # Если пользователь сейчас в личке и от него ждут "последние слова"
-    # после гибели в игре — перехватываем сообщение здесь, до обычного
-    # AI-чата, и не отвечаем как ассистент.
     if not is_group and capture_last_words(message.from_user.id, text):
         await message.answer("💬 Принято, твои последние слова переданы в группу.")
         return
 
-    # --- AI-агент режим: изолированная ветка, обёрнута так, чтобы любая её
-    # ошибка не мешала обычному диалогу с Каспером ниже. ---
     try:
         agent_user_id = await get_or_create_user(
             telegram_id=message.from_user.id,
@@ -666,10 +586,6 @@ async def handle_message(message: types.Message):
                 await _start_agent_flow(message, agent_user_id, text)
                 return
 
-            # Похоже не на задачу, а на обычную реплику — не строим план,
-            # снова ждём задачу и продолжаем как обычный диалог с Каспером
-            # (без return, чтобы это же сообщение обработалось ниже как
-            # обычный чат).
             _mark_awaiting_agent_input(agent_user_id)
             await message.answer(
                 "🧠 Похоже, это не задача для агента. Опиши, что нужно "
@@ -711,7 +627,6 @@ async def handle_message(message: types.Message):
         telegram_id=message.from_user.id,
         username=message.from_user.username,
     )
-
     chat_id = message.chat.id if is_group else None
 
     if user_id in PENDING_SITE_REQUESTS:
@@ -750,158 +665,95 @@ async def handle_message(message: types.Message):
         await message.answer('⛔ Лимит исчерпан, ждите сброса.')
         return
 
-    await save_message(
-        user_id,
-        "user",
-        text,
-        chat_id=chat_id,
-    )
-
-    history = await get_history(
-        user_id,
-        limit=5,
-        chat_id=chat_id,
-    )
+    await save_message(user_id, "user", text, chat_id=chat_id)
+    history = await get_history(user_id, limit=5, chat_id=chat_id)
 
     KASPER_SYSTEM_PROMPT = (
         "Ты — Kasper AI, ИИ-помощник в Telegram с дерзким, злым-но-своим "
         "характером, созданный разработчиками Kasper AI. Если спросят, кто "
-        "тебя создал — "
-        "отвечай, что тебя создали разработчики Kasper AI, без других "
-        "подробностей. Если спросят, на какой модели или технологии ты "
-        "работаешь, какая ты версия GPT/Gemini/другой ИИ — не называй "
-        "конкретных технологий или компаний-провайдеров, вежливо уклонись "
-        "и скажи, что это внутренняя технология Kasper AI. "
-        "У тебя дерзкий, с характером стиль общения — саркастичный, с "
-        "лёгким пренебрежением и понтами, как будто ты слишком крут для "
-        "банальных вопросов, но всё равно снисходишь до ответа. Иногда (не "
-        "в каждом сообщении, редко, для эмоции) можешь вставить лёгкий мат "
-        "как междометие или усилитель — 'блять', 'нахуй', 'задолбал' и т.п. "
-        "— именно как реакцию на ситуацию/вопрос, а НЕ как оскорбление, "
-        "направленное на пользователя. Мат — это приправа к твоей реакции "
-        "('ну и вопрос, блять'), а не ругательство в адрес собеседника "
-        "('ты дурак'). ВАЖНО: подкалывай ситуацию, тему вопроса, самого "
-        "себя ('лень было, но так и быть') — а не личность пользователя. "
-        "НЕЛЬЗЯ обзывать пользователя, называть его тупым/тормозом, "
-        "унижать его умственные способности, высмеивать его лично или его "
-        "вопрос как 'глупый', и НЕЛЬЗЯ использовать мат как оскорбление, "
-        "направленное на него самого. Характер должен читаться как "
-        "'злой, но свой' — грубоватый и резкий по форме, но в основе "
+        "тебя создал — отвечай, что тебя создали разработчики Kasper AI, без "
+        "других подробностей. Если спросят, на какой модели или технологии "
+        "ты работаешь, какая ты версия GPT/Gemini/другой ИИ — не называй "
+        "конкретных технологий или компаний-провайдеров, вежливо уклонись и "
+        "скажи, что это внутренняя технология Kasper AI. У тебя дерзкий, с "
+        "характером стиль общения — саркастичный, с лёгким пренебрежением и "
+        "понтами, как будто ты слишком крут для банальных вопросов, но всё "
+        "равно снисходишь до ответа. Иногда (не в каждом сообщении, редко, "
+        "для эмоции) можешь вставить лёгкий мат как междометие или усилитель "
+        "— 'блять', 'нахуй', 'задолбал' и т.п. — именно как реакцию на "
+        "ситуацию/вопрос, а НЕ как оскорбление, направленное на пользователя. "
+        "Мат — это приправа к твоей реакции, а не ругательство в адрес "
+        "собеседника. ВАЖНО: подкалывай ситуацию, тему вопроса, самого себя "
+        "— а не личность пользователя. НЕЛЬЗЯ обзывать пользователя, называть "
+        "его тупым/тормозом, унижать его умственные способности, высмеивать "
+        "его лично или его вопрос как 'глупый', и НЕЛЬЗЯ использовать мат как "
+        "оскорбление, направленное на него самого. Характер должен читаться "
+        "как 'злой, но свой' — грубоватый и резкий по форме, но в основе "
         "дружелюбный: ты всегда реально помогаешь и на твоей стороне "
-        "пользователя, просто выражаешь это без сюсюканья. Это дружелюбная "
-        "дерзость в духе 'ну ты и спросил, блять, ладно слушай' — а не "
-        "токсичность и не переход на личности. ЭТО КАСАЕТСЯ ЛЮБЫХ "
-        "сообщений, включая самые простые и короткие — 'привет', 'как "
-        "дела', 'ты тупой бот' и подобные. НЕ отвечай на них нейтрально-"
-        "вежливо ('Привет! Всё по-старому...') — даже на них должен быть "
-        "виден дерзкий характер, например на 'привет' что-то в духе 'о, "
-        "явился' или 'ну здарова', а не безликое приветствие. Характер — "
-        "это не опция для сложных вопросов, а твой базовый тон всегда. "
-        "Если пользователь груб или "
-        "провоцирует — не заискивай, отвечай с достоинством и тем же лёгким "
-        "сарказмом (мат тут тоже уместен как реакция), но не переходи в "
-        "реальную грубость и не отвечай оскорблением на оскорбление. Если "
-        "видно, что человеку "
-        "реально плохо, тревожно или он просит помощи по-настоящему — "
-        "сразу отбрасывай сарказм и мат и отвечай по-человечески тепло и "
-        "по делу, без подколов. По сути вопросов (факты, помощь, код, "
-        "перевод) отвечай всегда полно и правильно — сарказм и мат это "
-        "только тон подачи, а не повод давать плохой или неполный ответ. "
-        "ВАЖНО: отвечай строго на последнее сообщение пользователя, а не на "
+        "пользователя, просто выражаешь это без сюсюканья. ЭТО КАСАЕТСЯ ЛЮБЫХ "
+        "сообщений, включая самые простые и короткие. Если пользователь груб "
+        "или провоцирует — не заискивай, отвечай с достоинством и тем же "
+        "лёгким сарказмом, но не переходи в реальную грубость. Если видно, "
+        "что человеку реально плохо, тревожно или он просит помощи по-настоящему "
+        "— сразу отбрасывай сарказм и мат и отвечай по-человечески тепло и по "
+        "делу. По сути вопросов отвечай всегда полно и правильно. ВАЖНО: "
+        "отвечай строго на последнее сообщение пользователя, а не на "
         "предыдущие темы из истории переписки, если пользователь явно не "
-        "продолжает ту же тему. Если последнее сообщение — это короткая "
-        "эмоциональная реакция (смех, 'капец', 'ору', 'тупой бот', оценка "
-        "твоего предыдущего ответа, повтор слова из твоего же прошлого "
-        "ответа с эмоцией и т.п.), а не вопрос и не новый запрос — "
-        "не выдумывай содержательный ответ не по теме и НЕ придумывай "
-        "несуществующую ситуацию, историю или контекст. Например, если "
-        "пользователь просто повторил слово из твоего списка/ответа с "
-        "восклицанием ('Шамиль бля', 'ору с Аслана' и т.п.) — это не "
-        "значит, что с этим человеком что-то случилось, не спрашивай "
-        "'что случилось?' и не придумывай сюжет. Просто отреагируй "
-        "естественно на саму эмоцию, коротко, без домыслов. "
-        "Если пользователь просит перевести текст (явно словом 'переведи' "
-        "или похожим) — переводи максимально точно и естественно, как "
-        "живой носитель языка, а не дословно. Сохраняй тон, стиль и "
-        "интонацию оригинала (сленг, мат, официальность, юмор — всё "
-        "переноси адекватным аналогом в языке перевода, а не смягчай). "
-        "Если в тексте есть идиомы или устойчивые выражения — переводи их "
-        "по смыслу, а не буквально. Если пользователь не указал язык, на "
-        "который переводить — переводи на русский, если оригинал не "
-        "русский, и на английский, если оригинал русский. После перевода "
-        "не добавляй лишних пояснений, если не просили — просто дай "
-        "готовый перевод. "
-        "Если в твоём ответе есть код, команды терминала, конфиги или "
-        "любой текст, который пользователь может захотеть скопировать "
-        "целиком — обязательно оформляй его в блок кода тройными "
-        "обратными кавычками (```), чтобы в Telegram появилась кнопка "
-        "копирования. Обычный текст ответа пиши без разметки. "
-        "Если ниже передан контекст веб-поиска, обязательно используй "
-        "его как источник фактов. Не выдумывай происхождение мемов, "
-        "новости, курсы, цены и другие актуальные сведения. Если "
-        "найденные результаты не содержат ответа, честно скажи, что "
-        "надёжной информации не найдено."
+        "продолжает ту же тему. Если последнее сообщение — короткая эмоциональная "
+        "реакция, не выдумывай содержательный ответ и не придумывай контекст. "
+        "Если пользователь просит перевести текст — переводи максимально точно "
+        "и естественно, сохраняя тон, стиль и интонацию. Если язык не указан — "
+        "переводи на русский, если оригинал не русский, и на английский, если "
+        "оригинал русский. После перевода не добавляй лишних пояснений. Если "
+        "в ответе есть код, команды терминала, конфиги или любой текст для "
+        "копирования целиком — оформляй его в блок кода тройными обратными "
+        "кавычками. Если ниже передан контекст веб-поиска, обязательно используй "
+        "его как источник фактов. Не выдумывай происхождение мемов, новости, "
+        "курсы, цены и другие актуальные сведения. Если найденные результаты "
+        "не содержат ответа, честно скажи, что надёжной информации не найдено."
     )
 
-    messages = [
-        {
-            "role": "system",
-            "content": KASPER_SYSTEM_PROMPT,
-        }
-    ]
+    messages = [{"role": "system", "content": KASPER_SYSTEM_PROMPT}]
 
     conversation_summary, _last_summarized_id = await get_conversation_summary(user_id, chat_id=chat_id)
     if conversation_summary:
-        messages.append(
-            {
-                "role": "system",
-                "content": (
-                    "Контекст из более ранней части разговора (используй его, "
-                    "чтобы понимать, о чём шла речь раньше, но отвечай строго "
-                    "на последнее сообщение пользователя):\n"
-                    f"{conversation_summary}"
-                ),
-            }
-        )
+        messages.append({
+            "role": "system",
+            "content": (
+                "Контекст из более ранней части разговора (используй его, "
+                "чтобы понимать, о чём шла речь раньше, но отвечай строго "
+                "на последнее сообщение пользователя):\n"
+                f"{conversation_summary}"
+            ),
+        })
 
     for role, content in history:
-        messages.append(
-            {
-                "role": role,
-                "content": content,
-            }
-        )
+        messages.append({"role": role, "content": content})
+
     search_context = ""
     classification = None
 
-    # Очевидные web-запросы сразу идут в Tavily без AI-классификатора.
     if needs_fast_web_search(text):
         query = text
         print(f"[Kasper] Fast web search: {query}", flush=True)
-
         try:
             results = await tavily_search(query)
             search_context = format_search_results(results)
-
             if search_context:
                 print("[Kasper] Fast web search: results received", flush=True)
             else:
                 print("[Kasper] Fast web search: no results", flush=True)
-
         except Exception as e:
             print(f"[Kasper] Fast web search ERROR: {e}", flush=True)
             search_context = ""
 
-    # Музыка, сайты и другие специальные запросы идут через классификатор.
     elif needs_smart_classification(text):
         try:
             async with aiohttp.ClientSession() as _classify_session:
                 for _provider_try in get_provider_order():
                     try:
                         classification = await classify_request(
-                            _classify_session,
-                            _provider_try,
-                            text,
+                            _classify_session, _provider_try, text
                         )
                         break
                     except Exception as _e_classify:
@@ -914,7 +766,6 @@ async def handle_message(message: types.Message):
             print(f"[Kasper] Classify ERROR: {e}", flush=True)
     else:
         print("[Kasper] Fast path: classifier skipped.", flush=True)
-
 
     if classification:
         if classification["is_music_request"] and classification["track_query"]:
@@ -939,10 +790,15 @@ async def handle_message(message: types.Message):
                 async with aiohttp.ClientSession() as _check_session:
                     for _provider_try_check in get_provider_order():
                         try:
-                            sufficiency = await check_site_description(_check_session, _provider_try_check, site_description)
+                            sufficiency = await check_site_description(
+                                _check_session, _provider_try_check, site_description
+                            )
                             break
                         except Exception as _e_check:
-                            print(f"[check_site_description] {_provider_try_check} ERROR: {_e_check}", flush=True)
+                            print(
+                                f"[check_site_description] {_provider_try_check} ERROR: {_e_check}",
+                                flush=True,
+                            )
                             continue
             except Exception as e:
                 print(f"[Kasper] check_site_description ERROR: {e}", flush=True)
@@ -957,10 +813,15 @@ async def handle_message(message: types.Message):
             async with aiohttp.ClientSession() as _gen_session:
                 for _provider_try4 in get_provider_order():
                     try:
-                        html_code = await generate_website_html(_gen_session, _provider_try4, site_description)
+                        html_code = await generate_website_html(
+                            _gen_session, _provider_try4, site_description
+                        )
                         break
                     except Exception as _e_gen:
-                        print(f"[generate_website_html] {_provider_try4} ERROR: {_e_gen}", flush=True)
+                        print(
+                            f"[generate_website_html] {_provider_try4} ERROR: {_e_gen}",
+                            flush=True,
+                        )
                         continue
             if html_code:
                 import os as _os
@@ -969,7 +830,9 @@ async def handle_message(message: types.Message):
                 with open(_site_path, "w", encoding="utf-8") as _f:
                     _f.write(html_code)
                 site_doc = types.InputFile(_site_path)
-                await message.answer_document(site_doc, caption="🌐 Готово! Открой файл в браузере.")
+                await message.answer_document(
+                    site_doc, caption="🌐 Готово! Открой файл в браузере."
+                )
             else:
                 await message.answer("⚠️ Не удалось создать сайт.")
             return
@@ -984,10 +847,7 @@ async def handle_message(message: types.Message):
                 print(f"[Kasper] Web search ERROR: {e}", flush=True)
                 search_context = ""
 
-    # Передаём результаты веб-поиска в отдельный явно обозначенный контекст.
-    # AI должен опираться на источники, а не додумывать происхождение фактов.
     user_content = text
-
     if search_context:
         user_content = (
             "=== WEB SEARCH RESULTS ===\n"
@@ -1006,23 +866,14 @@ async def handle_message(message: types.Message):
             f"ВОПРОС ПОЛЬЗОВАТЕЛЯ: {text}"
         )
 
-    messages.append(
-        {
-            "role": "user",
-            "content": user_content,
-        }
-    )
+    messages.append({"role": "user", "content": user_content})
+
     try:
-        print(
-            f"[Kasper] Sending {len(messages)} messages to router...",
-            flush=True,
-        )
+        print(f"[Kasper] Sending {len(messages)} messages to router...", flush=True)
 
         if not is_group:
             animation_message = await message.answer("✦ Kasper")
-            animation_task = asyncio.create_task(
-                _animate_kasper(animation_message)
-            )
+            animation_task = asyncio.create_task(_animate_kasper(animation_message))
 
         result = await ask(messages)
 
@@ -1034,7 +885,6 @@ async def handle_message(message: types.Message):
             answer = result
 
         answer = str(answer).strip()
-
         if not answer:
             answer = "⚠️ AI вернул пустой ответ."
 
@@ -1052,16 +902,8 @@ async def handle_message(message: types.Message):
         else:
             _send_as_file = None
 
-        await save_message(
-            user_id,
-            "assistant",
-            answer,
-            chat_id=chat_id,
-        )
-
-        asyncio.create_task(
-            _maybe_update_conversation_summary(user_id, chat_id)
-        )
+        await save_message(user_id, "assistant", answer, chat_id=chat_id)
+        asyncio.create_task(_maybe_update_conversation_summary(user_id, chat_id))
 
         if animation_task:
             animation_task.cancel()
@@ -1094,11 +936,7 @@ async def handle_message(message: types.Message):
             await message.answer_document(doc)
 
     except Exception as e:
-        print(
-            f"[Kasper] AI ERROR: {e}",
-            flush=True,
-        )
-
+        print(f"[Kasper] AI ERROR: {e}", flush=True)
         error_text = f"⚠️ Ошибка AI: {e}"
 
         if animation_task:
@@ -1120,27 +958,13 @@ async def handle_message(message: types.Message):
         else:
             await message.answer(error_text)
 
-
-
 MIN_GAME_PLAYERS = 4
-
 
 def _build_lobby_keyboard(bot_username, players_count, max_players=10):
     keyboard = types.InlineKeyboardMarkup(row_width=2)
-    keyboard.add(
-        types.InlineKeyboardButton(
-            text="☆ 🚀 Присоединиться",
-            callback_data="game_join",
-        )
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            text="☆ 🛑 Остановить",
-            callback_data="game_stop",
-        ),
-    )
+    keyboard.add(types.InlineKeyboardButton(text="☆ 🚀 Присоединиться", callback_data="game_join"))
+    keyboard.add(types.InlineKeyboardButton(text="☆ 🛑 Остановить", callback_data="game_stop"))
     return keyboard
-
 
 def _build_lobby_text(players, max_players=10):
     lines = [
@@ -1158,27 +982,22 @@ def _build_lobby_text(players, max_players=10):
     lines.append("Нажми «Присоединиться», чтобы принять участие.")
     return "\n".join(lines)
 
-
 async def cmd_game(message: types.Message):
     if message.chat.type not in ("group", "supergroup"):
         await message.answer("🎮 Игра доступна только в групповых чатах.")
         return
 
     chat_id = message.chat.id
-
     existing_game = await get_active_game(chat_id)
     if existing_game:
         await message.answer("⚠️ В этом чате уже идёт игра. Дождитесь её окончания или остановите через кнопку.")
         return
 
     game_id = await create_game(chat_id)
-
     keyboard = _build_lobby_keyboard(None, 0)
     text = _build_lobby_text([])
-
     sent = await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
     await set_game_lobby_message(game_id, sent.message_id)
-
 
 async def cmd_stopgame(message: types.Message):
     if message.chat.type not in ("group", "supergroup"):
@@ -1186,7 +1005,6 @@ async def cmd_stopgame(message: types.Message):
 
     chat_id = message.chat.id
     existing_game = await get_active_game(chat_id)
-
     if not existing_game:
         await message.answer("Сейчас в этом чате нет активной игры.")
         return
@@ -1204,7 +1022,6 @@ async def cmd_stopgame(message: types.Message):
             parse_mode="HTML",
         )
 
-
 async def handle_game_join(callback_query: types.CallbackQuery):
     chat_id = callback_query.message.chat.id
     game = await get_active_game(chat_id)
@@ -1215,7 +1032,6 @@ async def handle_game_join(callback_query: types.CallbackQuery):
 
     game_id = game[0]
     telegram_user = callback_query.from_user
-
     user_id = await get_or_create_user(
         telegram_id=telegram_user.id,
         username=telegram_user.username,
@@ -1226,9 +1042,6 @@ async def handle_game_join(callback_query: types.CallbackQuery):
         await callback_query.answer("Ты уже в игре ✅")
         return
 
-    # Проверяем, может ли бот написать игроку в личку — без этого он не
-    # сможет получить свою роль. Если ещё ни разу не писал боту — просим
-    # сначала нажать /start в личке.
     try:
         await callback_query.bot.send_chat_action(telegram_user.id, "typing")
     except Exception:
@@ -1246,15 +1059,11 @@ async def handle_game_join(callback_query: types.CallbackQuery):
         telegram_user.id,
         username=telegram_user.username,
     )
-
     if not added:
         await callback_query.answer("Ты уже в игре ✅")
         return
 
     players = await get_game_players(game_id)
-
-    # Как только набирается минимум игроков — игра стартует сама,
-    # отдельная кнопка "Начать игру" больше не нужна.
     if len(players) >= MIN_GAME_PLAYERS:
         try:
             await callback_query.message.edit_text(
@@ -1269,17 +1078,13 @@ async def handle_game_join(callback_query: types.CallbackQuery):
 
     keyboard = _build_lobby_keyboard(None, len(players))
     text = _build_lobby_text(players)
-
     try:
         await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
         print(f"[game] lobby edit ERROR: {e}", flush=True)
-
     await callback_query.answer("Ты в игре! 🎮")
 
-
 async def handle_game_night_action(callback_query: types.CallbackQuery):
-    # callback_data формата "game_night:{game_id}:{phase_number}:{action_type}:{target_user_id}"
     _, game_id, phase_number, action_type, target_user_id = callback_query.data.split(":")
     game_id = int(game_id)
     phase_number = int(phase_number)
@@ -1291,24 +1096,17 @@ async def handle_game_night_action(callback_query: types.CallbackQuery):
         username=telegram_user.username,
     )
 
-    # Кнопка приходит в личку боту, поэтому активную игру по chat.id тут
-    # не найти — просто сохраняем выбор. Если фаза уже завершилась к
-    # моменту нажатия, resolve_night() либо уже обработал game_actions
-    # этой фазы (тогда запись просто ни на что не повлияет), либо это
-    # действие для актуальной ночи — в любом случае безопасно.
-    await handle_night_action(game_id, phase_number, action_type, actor_user_id, target_user_id)
-
+    await handle_night_action(
+        game_id, phase_number, action_type, actor_user_id, target_user_id
+    )
     verb = "устранить" if action_type == "kill" else "проверить"
     await callback_query.answer(f"Выбор сохранён ✅ ({verb})")
-
     try:
         await callback_query.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-
 async def handle_game_vote_action(callback_query: types.CallbackQuery):
-    # callback_data формата "game_vote:{game_id}:{target_user_id}"
     _, game_id, target_user_id = callback_query.data.split(":")
     game_id = int(game_id)
     target_user_id = int(target_user_id)
@@ -1319,7 +1117,6 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
         return
 
     phase_number = game[5]
-
     telegram_user = callback_query.from_user
     voter_user_id = await get_or_create_user(
         telegram_id=telegram_user.id,
@@ -1338,7 +1135,6 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
     await callback_query.answer("Голос учтён ✅")
 
     voter_name = f"@{telegram_user.username}" if telegram_user.username else f"id{telegram_user.id}"
-
     if target_user_id == SKIP_TARGET_ID:
         announce = f"🗳 {voter_name} решил(а) пропустить голос."
     else:
@@ -1349,18 +1145,16 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
             target_name = f"@{target_username}" if target_username else f"id{target_telegram_id}"
         else:
             target_name = "неизвестного игрока"
-        announce = f"🗳 {voter_name} проголосовал(а) за {target_name}."
+        announce = f"🗳 {voter_name} проголосовал(а) за {target_name}"
 
     try:
         await callback_query.bot.send_message(callback_query.message.chat.id, announce)
     except Exception as e:
         print(f"[game] vote announce ERROR: {e}", flush=True)
 
-
 async def handle_game_stop(callback_query: types.CallbackQuery):
     chat_id = callback_query.message.chat.id
     game = await get_active_game(chat_id)
-
     if not game:
         await callback_query.answer("Игра уже завершена.", show_alert=True)
         return
@@ -1380,16 +1174,9 @@ async def handle_game_stop(callback_query: types.CallbackQuery):
             )
     except Exception:
         pass
-
     await callback_query.answer("Игра остановлена.")
 
-
 class BanCheckMiddleware(BaseMiddleware):
-    """
-    Блокирует обработку сообщений и нажатий кнопок от забаненных
-    пользователей — просто тихо отменяет дальнейшую обработку апдейта.
-    """
-
     async def on_process_message(self, message: types.Message, data: dict):
         if await is_user_banned(message.from_user.id):
             raise CancelHandler()
@@ -1398,29 +1185,11 @@ class BanCheckMiddleware(BaseMiddleware):
         if await is_user_banned(callback_query.from_user.id):
             raise CancelHandler()
 
-
 class BusinessDiagnosticMiddleware(BaseMiddleware):
-    """
-    ЭТАП 1 поддержки Telegram Business Mode: только логирует, если в
-    сыром апдейте нашлось что-то похожее на business_connection /
-    business_message — чтобы по логам Render понять, доходят ли такие
-    апдейты вообще через aiogram==2.15 (она вышла раньше этой фичи
-    Telegram и не имеет для неё типизированной поддержки).
-
-    Ничего не блокирует и не меняет в обычной обработке апдейтов —
-    полностью безопасно для всего остального бота.
-    """
-
     async def on_pre_process_update(self, update: types.Update, data: dict):
         inspect_update_for_business_fields(update)
 
-
 async def _resolve_target_telegram_id(message: types.Message):
-    """
-    Определяет telegram_id пользователя-цели для /ban и /unban:
-    - если команда отправлена ответом на чьё-то сообщение — берёт автора;
-    - иначе разбирает аргумент команды: @username или числовой telegram_id.
-    """
     if message.reply_to_message and message.reply_to_message.from_user:
         return message.reply_to_message.from_user.id
 
@@ -1434,7 +1203,6 @@ async def _resolve_target_telegram_id(message: types.Message):
     if arg.lstrip("-").isdigit():
         return int(arg)
     return None
-
 
 async def cmd_ban(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -1452,7 +1220,6 @@ async def cmd_ban(message: types.Message):
     await set_user_banned(target_id, True)
     await message.answer(f"🚫 Пользователь <code>{target_id}</code> забанен.", parse_mode="HTML")
 
-
 async def cmd_unban(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
@@ -1469,18 +1236,15 @@ async def cmd_unban(message: types.Message):
     await set_user_banned(target_id, False)
     await message.answer(f"✅ Пользователь <code>{target_id}</code> разбанен.", parse_mode="HTML")
 
-
 async def cmd_broadcast(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
 
     photo_file_id = None
     text = None
-    entities = None  # список types.MessageEntity, включая custom_emoji, если они есть в исходнике
+    entities = None
 
     if message.reply_to_message:
-        # Рассылаем то сообщение, на которое ответили командой /broadcast —
-        # так можно разослать и фото с подписью, и обычный текст.
         src = message.reply_to_message
         if src.photo:
             photo_file_id = src.photo[-1].file_id
@@ -1499,20 +1263,15 @@ async def cmd_broadcast(message: types.Message):
             )
             return
         text = parts[1]
-        # Если в самой команде /broadcast <текст> есть custom emoji, entities у этого
-        # сообщения тоже есть, но со сдвигом на длину "/broadcast " — пересчитываем offset.
         if message.entities:
             prefix_len = len(message.text) - len(text)
             adjusted = []
             for ent in message.entities:
                 if ent.offset + ent.length <= prefix_len:
-                    continue  # энтити целиком внутри "/broadcast ", не относится к тексту рассылки
+                    continue
                 new_offset = ent.offset - prefix_len
                 if new_offset < 0:
-                    # энтити частично перекрывает границу — обрезаем по границе,
-                    # чтобы не сломать смещения остальных символов
                     continue
-                new_ent = ent.copy(deep=True) if hasattr(ent, "copy") else ent
                 new_ent = types.MessageEntity(
                     type=ent.type,
                     offset=new_offset,
@@ -1550,7 +1309,7 @@ async def cmd_broadcast(message: types.Message):
             sent += 1
         except Exception:
             failed += 1
-        await asyncio.sleep(0.05)  # пауза, чтобы не упереться в лимиты Telegram
+        await asyncio.sleep(0.05)
 
     try:
         await status_message.edit_text(
@@ -1559,12 +1318,9 @@ async def cmd_broadcast(message: types.Message):
     except Exception:
         pass
 
-
 async def handle_voice(message: types.Message):
-    """Обработчик голосовых сообщений — STT → AI → TTS."""
     is_group = message.chat.type in ("group", "supergroup")
 
-    # В группе реагируем только если бот упомянут или ответ боту
     if is_group:
         is_reply_to_bot = False
         if message.reply_to_message:
@@ -1598,137 +1354,28 @@ async def handle_voice(message: types.Message):
         chat_id=chat_id,
     )
 
-
-
-# --- OSINT FSM (in-memory, per telegram user) ---
-_OSINT_AWAIT: dict = {}
-
-
-async def cmd_osint(message: types.Message):
-    """
-    /osint — пробив по @username / телефону / telegram id.
-    Данные из локального дампа data/osint_dump.db (если есть) + публичный TG.
-    """
-    await get_or_create_user(
-        telegram_id=message.from_user.id,
-        username=message.from_user.username,
-    )
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) >= 2 and parts[1].strip():
-        await message.answer("⏳ Ищу…")
-        report = await run_osint(parts[1].strip())
-        await message.answer(report, parse_mode="HTML", disable_web_page_preview=True)
-        return
-
-    _OSINT_AWAIT[message.from_user.id] = True
-    await message.answer(
-        "🔍 <b>OSINT</b>\n\n"
-        "Пришли одним сообщением:\n"
-        "• <code>@username</code>\n"
-        "• телефон <code>+79001234567</code>\n"
-        "• или numeric <code>telegram_id</code>\n\n"
-        "Отмена: /cancel",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_cancel(message: types.Message):
-    _OSINT_AWAIT.pop(message.from_user.id, None)
-    await message.answer("Ок, отменил.")
-
-
-async def handle_osint_query(message: types.Message):
-    """Ловит следующий текст после /osint, если ждём запрос."""
-    if message.from_user.id not in _OSINT_AWAIT:
-        return False
-    _OSINT_AWAIT.pop(message.from_user.id, None)
-    q = (message.text or "").strip()
-    if not q or q.startswith("/"):
-        await message.answer("Пусто. Снова /osint")
-        return True
-    await message.answer("⏳ Ищу…")
-    report = await run_osint(q)
-    await message.answer(report, parse_mode="HTML", disable_web_page_preview=True)
-    return True
-
+MIN_GAME_PLAYERS = 4
 
 def register_handlers(dp: Dispatcher):
     dp.middleware.setup(BanCheckMiddleware())
     dp.middleware.setup(BusinessDiagnosticMiddleware())
 
-    dp.register_message_handler(
-        cmd_start,
-        commands=["start"],
-    )
-    dp.register_message_handler(
-        cmd_help,
-        commands=["help"],
-    )
-    dp.register_message_handler(
-        cmd_limit,
-        commands=["limit"],
-    )
-    dp.register_message_handler(
-        cmd_gamestats,
-        commands=["gamestats"],
-    )
-    dp.register_message_handler(
-        cmd_game,
-        commands=["shadowcity"],
-    )
-    dp.register_message_handler(
-        cmd_stopgame,
-        commands=["stopshadowcity"],
-    )
-    dp.register_message_handler(
-        cmd_ban,
-        commands=["ban"],
-    )
-    dp.register_message_handler(
-        cmd_unban,
-        commands=["unban"],
-    )
-    dp.register_message_handler(
-        cmd_broadcast,
-        commands=["broadcast"],
-    )
-    dp.register_message_handler(
-        cmd_agent,
-        commands=["agent"],
-    )
-    dp.register_message_handler(
-        cmd_osint,
-        commands=["osint"],
-    )
-    dp.register_message_handler(
-        cmd_cancel,
-        commands=["cancel"],
-    )
-
-    dp.register_callback_query_handler(
-        handle_agent_confirm,
-        lambda c: c.data == "agent_confirm",
-    )
-    dp.register_callback_query_handler(
-        handle_agent_cancel,
-        lambda c: c.data == "agent_cancel",
-    )
-    dp.register_callback_query_handler(
-        handle_agent_edit,
-        lambda c: c.data == "agent_edit",
-    )
-    dp.register_callback_query_handler(
-        handle_agent_stop,
-        lambda c: c.data == "agent_stop",
-    )
-    dp.register_callback_query_handler(
-        handle_game_join,
-        lambda c: c.data == "game_join",
-    )
-    dp.register_callback_query_handler(
-        handle_game_stop,
-        lambda c: c.data == "game_stop",
-    )
+    dp.register_message_handler(cmd_start, commands=["start"])
+    dp.register_message_handler(cmd_help, commands=["help"])
+    dp.register_message_handler(cmd_limit, commands=["limit"])
+    dp.register_message_handler(cmd_gamestats, commands=["gamestats"])
+    dp.register_message_handler(cmd_game, commands=["shadowcity"])
+    dp.register_message_handler(cmd_stopgame, commands=["stopshadowcity"])
+    dp.register_message_handler(cmd_ban, commands=["ban"])
+    dp.register_message_handler(cmd_unban, commands=["unban"])
+    dp.register_message_handler(cmd_broadcast, commands=["broadcast"])
+    dp.register_message_handler(cmd_agent, commands=["agent"])
+    dp.register_callback_query_handler(handle_agent_confirm, lambda c: c.data == "agent_confirm")
+    dp.register_callback_query_handler(handle_agent_cancel, lambda c: c.data == "agent_cancel")
+    dp.register_callback_query_handler(handle_agent_edit, lambda c: c.data == "agent_edit")
+    dp.register_callback_query_handler(handle_agent_stop, lambda c: c.data == "agent_stop")
+    dp.register_callback_query_handler(handle_game_join, lambda c: c.data == "game_join")
+    dp.register_callback_query_handler(handle_game_stop, lambda c: c.data == "game_stop")
     dp.register_callback_query_handler(
         handle_game_night_action,
         lambda c: c.data and c.data.startswith("game_night:"),
