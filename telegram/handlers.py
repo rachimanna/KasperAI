@@ -1,6 +1,7 @@
 import asyncio
 import random
 import re
+import resource
 import time
 
 from aiogram import Dispatcher, types
@@ -25,6 +26,11 @@ from database.db import (
     is_user_banned,
     find_telegram_id_by_username,
     get_all_telegram_ids,
+    get_last_successful_provider,
+    get_provider_stats,
+    get_total_users_count,
+    get_active_users_count,
+    get_total_messages_count,
 )
 from config.settings import ADMIN_IDS
 from router.business import inspect_update_for_business_fields
@@ -444,9 +450,12 @@ async def cmd_help(message: types.Message):
         "🤖 Kasper AI\n\n"
         "/start — запуск\n"
         "/help — помощь\n"
-        "/memory — память\n"
-        "/project — проекты\n"
-        "/status — состояние системы"
+        "/limit — мой дневной лимит запросов\n"
+        "/status — состояние бота\n"
+        "/agent — AI-агент: найти/сравнить/сделать сайт\n"
+        "/shadowcity — начать игру «Теневой город»\n"
+        "/stopshadowcity — остановить текущую игру\n"
+        "/gamestats — моя статистика «Теневого города»"
     )
 
 async def cmd_limit(message: types.Message):
@@ -461,6 +470,28 @@ async def cmd_limit(message: types.Message):
     used, remaining = await get_limit_status(user_id, daily_limit=20)
     text = "📊 Использовано сегодня: " + str(used) + "/20" + chr(10) + "Осталось: " + str(remaining)
     await message.answer(text)
+
+def _current_memory_mb() -> float:
+    """Пиковое потребление памяти процесса в МБ (см. main.py::_current_memory_mb)."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+async def cmd_status(message: types.Message):
+    last_provider = await get_last_successful_provider()
+    if last_provider:
+        provider_line = f"🧠 Последний ответил: <b>{last_provider[0]}</b> ({last_provider[1]} UTC)"
+    else:
+        provider_line = "🧠 Провайдер: пока не было ни одного ответа"
+
+    memory_mb = _current_memory_mb()
+    users_count = await get_total_users_count()
+
+    await message.answer(
+        "📟 <b>Статус Kasper AI</b>\n\n"
+        f"{provider_line}\n"
+        f"💾 Память: {memory_mb:.1f} МБ (лимит 512 МБ на free-тарифе Render)\n"
+        f"👥 Пользователей всего: {users_count}",
+        parse_mode="HTML",
+    )
 
 ROLE_STATS_LABELS = {
     "role_shadow_count": ("🕶", "Тень"),
@@ -1300,6 +1331,36 @@ async def cmd_unban(message: types.Message):
     await set_user_banned(target_id, False)
     await message.answer(f"✅ Пользователь <code>{target_id}</code> разбанен.", parse_mode="HTML")
 
+async def cmd_stats(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+
+    total_users = await get_total_users_count()
+    active_24h = await get_active_users_count(hours=24)
+    messages_total = await get_total_messages_count()
+    messages_24h = await get_total_messages_count(hours=24)
+    provider_stats = await get_provider_stats(hours=24)
+
+    lines = [
+        "📊 <b>Статистика Kasper AI</b>",
+        "",
+        f"👥 Пользователей всего: {total_users}",
+        f"🟢 Активных за 24ч: {active_24h}",
+        f"💬 Сообщений всего: {messages_total}",
+        f"💬 Сообщений за 24ч: {messages_24h}",
+        "",
+        "🧠 <b>Провайдеры за 24ч:</b>",
+    ]
+
+    if provider_stats:
+        for p in provider_stats:
+            fail_rate = f" ({p['failed']}/{p['total']} упало)" if p["failed"] else ""
+            lines.append(f"• {p['provider']}: {p['total']} запросов{fail_rate}")
+    else:
+        lines.append("• пока нет данных за этот период")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
 async def cmd_broadcast(message: types.Message):
     if message.from_user.id not in ADMIN_IDS:
         return
@@ -1425,6 +1486,8 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(cmd_start, commands=["start"])
     dp.register_message_handler(cmd_help, commands=["help"])
     dp.register_message_handler(cmd_limit, commands=["limit"])
+    dp.register_message_handler(cmd_status, commands=["status"])
+    dp.register_message_handler(cmd_stats, commands=["stats"])
     dp.register_message_handler(cmd_gamestats, commands=["gamestats"])
     dp.register_message_handler(cmd_game, commands=["shadowcity"])
     dp.register_message_handler(cmd_stopgame, commands=["stopshadowcity"])
