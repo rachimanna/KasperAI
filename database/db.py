@@ -1,10 +1,15 @@
 import aiosqlite
 import os
-from datetime import datetime, timedelta
+from pathlib import Path
+from datetime import datetime
+import asyncio
 
-DB_PATH = os.getenv("DB_PATH", "kasper.db")
+# DATABASE_PATH — новый основной параметр. DB_PATH поддержан для старых
+# деплоев, чтобы существующая БД на Render не потерялась при обновлении.
+DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH") or "data/kasper.db"
 
 _db_conn = None
+_db_lock = asyncio.Lock()
 
 
 async def get_db():
@@ -13,9 +18,23 @@ async def get_db():
     """
     global _db_conn
     if _db_conn is None:
+        Path(DB_PATH).expanduser().parent.mkdir(parents=True, exist_ok=True)
         _db_conn = await aiosqlite.connect(DB_PATH)
         _db_conn.row_factory = aiosqlite.Row
+        await _db_conn.execute("PRAGMA foreign_keys = ON")
+        await _db_conn.execute("PRAGMA busy_timeout = 5000")
+        await _db_conn.execute("PRAGMA journal_mode = WAL")
     return _db_conn
+
+
+async def close_db():
+    """Корректно закрывает SQLite-соединение при остановке процесса."""
+    global _db_conn
+    if _db_conn is not None:
+        try:
+            await _db_conn.close()
+        finally:
+            _db_conn = None
 
 
 async def init_db():
@@ -78,6 +97,24 @@ async def init_db():
         )
         """
     )
+
+    # Дневные лимиты AI-агента — теперь тоже в SQLite и переживают рестарт.
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agent_usage_limits (
+            user_id INTEGER PRIMARY KEY,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            last_date TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+
+    # Ускоряем самые частые выборки истории/лимитов/игр.
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id_id ON messages(chat_id, id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_private ON messages(user_id, id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_game_players_game_user ON game_players(game_id, user_id)")
+    await db.execute("CREATE INDEX IF NOT EXISTS idx_game_actions_lookup ON game_actions(game_id, phase_number, actor_user_id, action_type)")
 
     # Таблица игр
     await db.execute(
@@ -264,7 +301,18 @@ async def get_history(user_id, limit=20, chat_id=None):
 
     if chat_id is not None:
         cursor = await db.execute(
-            "SELECT role, content FROM messages WHERE chat_id = ? ORDER BY id DESC LIMIT ?",
+            """
+            SELECT m.role,
+                   CASE
+                       WHEN m.role = 'user' AND u.username IS NOT NULL AND u.username != ''
+                       THEN '[' || u.username || ']: ' || m.content
+                       ELSE m.content
+                   END AS content
+            FROM messages m
+            JOIN users u ON u.id = m.user_id
+            WHERE m.chat_id = ?
+            ORDER BY m.id DESC LIMIT ?
+            """,
             (chat_id, limit),
         )
     else:
@@ -310,120 +358,85 @@ async def get_last_message_id(user_id, chat_id=None):
 
 
 async def save_conversation_summary(user_id, summary, last_summarized_message_id, chat_id=None):
-    """
-    Сохраняет или обновляет саммари разговора.
-    
-    ФИКС #2: для групп теперь проверка по (user_id + chat_id),
-    чтобы не перезаписывать саммари других юзеров.
-    """
+    """Сохраняет summary. Для групп summary общий на chat_id."""
     db = await get_db()
-
     if chat_id is not None:
-        # БЫЛО: WHERE chat_id = ?
-        # СТАЛО: WHERE user_id = ? AND chat_id = ?
         cursor = await db.execute(
-            "SELECT id FROM conversation_summaries WHERE user_id = ? AND chat_id = ?",
-            (user_id, chat_id),
+            "SELECT id FROM conversation_summaries WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+            (chat_id,),
         )
     else:
         cursor = await db.execute(
-            "SELECT id FROM conversation_summaries WHERE user_id = ? AND chat_id IS NULL",
+            "SELECT id FROM conversation_summaries WHERE user_id = ? AND chat_id IS NULL LIMIT 1",
             (user_id,),
         )
-
     row = await cursor.fetchone()
-
     if row:
         await db.execute(
-            """
-            UPDATE conversation_summaries
-            SET summary = ?, last_summarized_message_id = ?
-            WHERE id = ?
-            """,
+            "UPDATE conversation_summaries SET summary = ?, last_summarized_message_id = ? WHERE id = ?",
             (summary, last_summarized_message_id, row[0]),
         )
     else:
         await db.execute(
-            """
-            INSERT INTO conversation_summaries (user_id, chat_id, summary, last_summarized_message_id)
-            VALUES (?, ?, ?, ?)
-            """,
+            "INSERT INTO conversation_summaries (user_id, chat_id, summary, last_summarized_message_id) VALUES (?, ?, ?, ?)",
             (user_id, chat_id, summary, last_summarized_message_id),
         )
-
     await db.commit()
 
 
 async def get_conversation_summary(user_id, chat_id=None):
-    """
-    Возвращает саммари разговора.
-    """
     db = await get_db()
-
     if chat_id is not None:
-        # ФИКС #2: проверка по (user_id + chat_id)
         cursor = await db.execute(
-            "SELECT summary, last_summarized_message_id FROM conversation_summaries WHERE user_id = ? AND chat_id = ?",
-            (user_id, chat_id),
+            "SELECT summary, last_summarized_message_id FROM conversation_summaries WHERE chat_id = ? ORDER BY id DESC LIMIT 1",
+            (chat_id,),
         )
     else:
         cursor = await db.execute(
-            "SELECT summary, last_summarized_message_id FROM conversation_summaries WHERE user_id = ? AND chat_id IS NULL",
+            "SELECT summary, last_summarized_message_id FROM conversation_summaries WHERE user_id = ? AND chat_id IS NULL LIMIT 1",
             (user_id,),
         )
-
     row = await cursor.fetchone()
-    if row:
-        return row[0], row[1]
-    return None, None
+    return (row[0], row[1]) if row else (None, None)
 
 
 async def check_and_increment_limit(user_id, daily_limit=20, telegram_id=None):
-    """
-    Проверяет лимит запросов пользователя.
-    Возвращает (можно_ли_запросить, оставшиеся_запросы).
-    
-    ПРИМЕЧАНИЕ: бот бесплатный, лимиты не критичны,
-    но race condition всё равно присутствует (если 2 запроса одновременно).
-    """
+    """Атомарно проверяет и увеличивает дневной лимит."""
     db = await get_db()
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    cursor = await db.execute(
-        "SELECT request_count, last_date FROM usage_limits WHERE user_id = ?",
-        (user_id,),
-    )
-    row = await cursor.fetchone()
-
-    if row is None:
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    async with _db_lock:
         await db.execute(
-            "INSERT INTO usage_limits (user_id, request_count, last_date) VALUES (?, 1, ?)",
+            """
+            INSERT INTO usage_limits(user_id, request_count, last_date)
+            VALUES (?, 0, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
             (user_id, today),
         )
-        await db.commit()
-        return True, daily_limit - 1
-
-    count = row[0]
-    last_date = row[1]
-
-    if last_date != today:
         await db.execute(
-            "UPDATE usage_limits SET request_count = 1, last_date = ? WHERE user_id = ?",
-            (today, user_id),
+            """
+            UPDATE usage_limits
+            SET request_count = CASE WHEN last_date = ? THEN request_count ELSE 0 END,
+                last_date = ?
+            WHERE user_id = ?
+            """,
+            (today, today, user_id),
         )
+        cursor = await db.execute(
+            """
+            UPDATE usage_limits
+            SET request_count = request_count + 1
+            WHERE user_id = ? AND last_date = ? AND request_count < ?
+            RETURNING request_count
+            """,
+            (user_id, today, daily_limit),
+        )
+        row = await cursor.fetchone()
         await db.commit()
-        return True, daily_limit - 1
-
-    if count >= daily_limit:
+    if row is None:
         return False, 0
-
-    await db.execute(
-        "UPDATE usage_limits SET request_count = request_count + 1 WHERE user_id = ?",
-        (user_id,),
-    )
-    await db.commit()
-
-    return True, daily_limit - count - 1
+    used = int(row[0])
+    return True, max(0, daily_limit - used)
 
 
 async def get_usage_count(user_id):
@@ -446,6 +459,44 @@ async def get_usage_count(user_id):
         return 0
 
     return row[0]
+
+
+async def check_and_increment_agent_limit(user_id, daily_limit=15):
+    """Атомарный дневной лимит агента, сохраняемый в SQLite."""
+    db = await get_db()
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    async with _db_lock:
+        await db.execute(
+            """
+            INSERT INTO agent_usage_limits(user_id, request_count, last_date)
+            VALUES (?, 0, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (user_id, today),
+        )
+        await db.execute(
+            """
+            UPDATE agent_usage_limits
+            SET request_count = CASE WHEN last_date = ? THEN request_count ELSE 0 END,
+                last_date = ?
+            WHERE user_id = ?
+            """,
+            (today, today, user_id),
+        )
+        cursor = await db.execute(
+            """
+            UPDATE agent_usage_limits
+            SET request_count = request_count + 1
+            WHERE user_id = ? AND last_date = ? AND request_count < ?
+            RETURNING request_count
+            """,
+            (user_id, today, daily_limit),
+        )
+        row = await cursor.fetchone()
+        await db.commit()
+    if row is None:
+        return False, 0
+    return True, max(0, daily_limit - int(row[0]))
 
 
 # ==================== ИГРА ====================
