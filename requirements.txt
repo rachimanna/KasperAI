@@ -20,5 +20,7 @@ setuptools==84.0.0
 wheel==0.48.0
 yarl==1.24.5
 yt-dlp==2026.8.19
-edge-tts==7.2.8
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.4.1
+numpy==1.26.4
 imageio-ffmpeg==0.6.0
