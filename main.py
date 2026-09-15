@@ -1,100 +1,96 @@
-
-95
-96
-97
-98
-99
-100
-101
-102
-103
-104
-105
-106
-107
-108
-109
-110
-111
-112
-113
-114
-115
-116
-117
-118
-119
-120
-121
-122
-123
-124
-125
-126
-127
-128
-129
-130
-131
-132
-133
-134
-135
-136
-137
-138
-139
-140
-141
-142
-143
-144
-145
-146
-147
-148
-149
-150
-151
-152
-153
-154
-155
-156
-157
-158
-159
-160
-161
-162
-163
-164
-165
-166
-167
-168
-169
-170
-171
-172
-173
-174
-175
-176
-177
-178
-179
-180
-181
-182
-183
-184
-185
-186
-187
-188
 import asyncio
 import logging
+import os
+import resource
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher
+from aiogram import executor
+
+from database.db import init_db, close_db
+from router.ai_router import init_http_session, close_http_session
+from router.game_logic import phase_checker_loop
+from router.business_raw_diag import patch_check_result_for_business_diag
+from telegram.handlers import register_handlers
+from config.settings import ADMIN_IDS
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def run_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    server.serve_forever()
+
+
+def _current_memory_mb() -> float:
+    """
+    Пиковое потребление памяти процесса в МБ через resource.getrusage —
+    без сторонних зависимостей (psutil не установлена, добавлять её ради
+    одной метрики незачем). На Linux ru_maxrss в килобайтах.
+
+    Нужно, потому что Render Metrics -> Memory на free-тарифе недоступен
+    (это платная фича, "Application Metrics" под платным планом) — так
+    единственный способ понять, упирается ли процесс в лимит 512MB,
+    это логировать это самостоятельно и смотреть в обычных логах Render.
+    """
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+
+
+async def memory_logger_loop(interval_seconds: int = 60):
+    """
+    Раз в interval_seconds логирует текущее (пиковое) потребление памяти
+    процесса. Позволяет по логам Render сопоставить моменты рестартов
+    (TerminatedByOtherGetUpdates и т.п.) с уровнем памяти прямо перед этим —
+    без доступа к платным Application Metrics.
+    """
+    while True:
+        try:
+            mb = _current_memory_mb()
+            print(f"[memory] RSS peak = {mb:.1f} MB (limit 512 MB on free tier)", flush=True)
+        except Exception as e:
+            print(f"[memory] logger error: {e}", flush=True)
+        await asyncio.sleep(interval_seconds)
+
+
+async def on_startup(dp):
+    await init_http_session()
+    await init_db()
+
+    from aiogram.types import BotCommand, BotCommandScopeChat
+
+    # Полностью очищаем старые команды Telegram.
+    try:
+        await dp.bot.delete_my_commands()
+    except Exception as e:
+        print(f"[Commands] default scope cleanup error: {e}", flush=True)
+
+    # Устанавливаем актуальные команды для всех пользователей.
+    await dp.bot.set_my_commands([
+        BotCommand("start", "Запустить бота"),
+        BotCommand("limit", "Мой лимит запросов"),
+        BotCommand("status", "Состояние бота"),
+        BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
+        BotCommand("shadowcity", "Начать игру «Теневой город»"),
+        BotCommand("stopshadowcity", "Остановить текущую игру"),
+        BotCommand("gamestats", "Моя статистика «Теневого города»"),
+    ])
+
+    # Админские команды показываем в подсказках только самим админам —
+    # через scope=BotCommandScopeChat(chat_id=admin_id), а не в общем
+    # меню, иначе их увидят и смогут попытаться вызвать все пользователи.
+    admin_commands = [
+        BotCommand("start", "Запустить бота"),
         BotCommand("limit", "Мой лимит запросов"),
         BotCommand("status", "Состояние бота"),
         BotCommand("agent", "AI-агент: найти/сравнить/сделать сайт"),
