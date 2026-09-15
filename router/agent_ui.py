@@ -1,25 +1,836 @@
-"""
-Inline-клавиатуры для AI-агент режима. Вынесены отдельно от handlers.py,
-чтобы не раздувать и без того большой файл — сама логика планирования и
-выполнения живёт в router/agent.py, здесь только UI.
-"""
+import json
+import os
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+import aiohttp
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
 
 
-def plan_confirmation_keyboard() -> InlineKeyboardMarkup:
-    keyboard = InlineKeyboardMarkup(row_width=3)
-    keyboard.add(
-        InlineKeyboardButton("☆ ✅ Выполнить", callback_data="agent_confirm"),
-        InlineKeyboardButton("☆ ✏️ Изменить", callback_data="agent_edit"),
-        InlineKeyboardButton("☆ ❌ Отмена", callback_data="agent_cancel"),
+TIMEOUT = aiohttp.ClientTimeout(
+    total=45,
+    connect=10,
+    sock_connect=10,
+    sock_read=35,
+)
+
+
+_http_session = None
+
+
+async def init_http_session():
+    global _http_session
+
+    if _http_session is None or _http_session.closed:
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=50,
+            ttl_dns_cache=300,
+        )
+        _http_session = aiohttp.ClientSession(
+            timeout=TIMEOUT,
+            connector=connector,
+        )
+
+
+async def close_http_session():
+    global _http_session
+
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+
+    _http_session = None
+
+
+async def _post(session, url, headers, payload):
+    async with session.post(
+        url,
+        headers=headers,
+        json=payload,
+    ) as response:
+        body = await response.text()
+        return response.status, body
+
+
+async def ask_gemini(session, messages):
+    key = os.getenv("GEMINI_API_KEY")
+    model = os.getenv("GEMINI_MODEL")
+
+    if not key:
+        raise RuntimeError("Gemini API key is missing")
+
+    if not model:
+        raise RuntimeError("Gemini model is missing")
+
+    contents = []
+
+    for message in messages:
+        role = message.get("role", "user")
+
+        if role == "assistant":
+            role = "model"
+        else:
+            role = "user"
+
+        content = str(message.get("content", ""))
+
+        if not content:
+            continue
+
+        contents.append(
+            {
+                "role": role,
+                "parts": [
+                    {
+                        "text": content,
+                    }
+                ],
+            }
+        )
+
+    if not contents:
+        raise RuntimeError("Gemini received empty messages")
+
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"v1beta/models/{model}:generateContent"
     )
-    return keyboard
 
+    payload = {
+        "contents": contents,
+    }
 
-def stop_keyboard() -> InlineKeyboardMarkup:
-    keyboard = InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        InlineKeyboardButton("☆ ⏹ Остановить", callback_data="agent_stop"),
+    status, body = await _post(
+        session,
+        url,
+        {
+            "x-goog-api-key": key,
+            "Content-Type": "application/json",
+        },
+        payload,
     )
-    return keyboard
+
+    if status >= 400:
+        raise RuntimeError(
+            f"Gemini HTTP {status}: {body[:500]}"
+        )
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"Gemini returned invalid JSON: {body[:500]}"
+        )
+
+    try:
+        parts = data["candidates"][0]["content"]["parts"]
+
+        text_parts = []
+
+        for part in parts:
+            if isinstance(part, dict) and "text" in part:
+                text_parts.append(part["text"])
+
+        answer = "".join(text_parts).strip()
+
+        if not answer:
+            raise RuntimeError(
+                f"Gemini returned empty answer: {body[:500]}"
+            )
+
+        return answer
+
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(
+            f"Unexpected Gemini response: {body[:500]}"
+        )
+
+
+_groq_key_index = 0
+
+async def _call_groq_with_key(session, key, model, url, clean_messages):
+    payload = {
+        "model": model,
+        "messages": clean_messages,
+    }
+    if "gpt-oss" in model:
+        payload["reasoning_effort"] = os.getenv("GROQ_REASONING_EFFORT", "low")
+
+    status, body = await _post(
+        session,
+        url,
+        {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+
+    if status >= 400:
+        raise RuntimeError(f"groq HTTP {status}: {body[:500]}")
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"groq returned invalid JSON: {body[:500]}")
+
+    try:
+        answer = data["choices"][0]["message"]["content"]
+        if not answer:
+            raise RuntimeError("groq returned empty answer")
+        return str(answer).strip()
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"Unexpected groq response: {body[:500]}")
+
+
+async def ask_openai_compatible(session, provider, messages):
+    if provider == "groq":
+        model = os.getenv("GROQ_MODEL")
+        url = "https://api.groq.com/openai/v1/chat/completions"
+
+        if not model:
+            raise RuntimeError("groq model is missing")
+
+        clean_messages = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = str(message.get("content", ""))
+            if not content:
+                continue
+            if role not in ("system", "user", "assistant"):
+                role = "user"
+            clean_messages.append({"role": role, "content": content})
+
+        if not clean_messages:
+            raise RuntimeError("groq received empty messages")
+
+        keys = [
+            k for k in [os.getenv("GROQ_API_KEY"), os.getenv("GROQ_API_KEY_2")]
+            if k
+        ]
+        if not keys:
+            raise RuntimeError("groq API key is missing")
+
+        # Round-robin: распределяем параллельные запросы между ключами.
+        global _groq_key_index
+        start_index = _groq_key_index % len(keys)
+        _groq_key_index = (_groq_key_index + 1) % len(keys)
+
+        last_error = None
+        for offset in range(len(keys)):
+            i = (start_index + offset) % len(keys)
+            key = keys[i]
+            try:
+                return await _call_groq_with_key(
+                    session, key, model, url, clean_messages
+                )
+            except Exception as e:
+                last_error = e
+                print(f"[groq] key #{i+1} failed: {e}", flush=True)
+
+        raise last_error
+
+    elif provider == "cerebras":
+        key = os.getenv("CEREBRAS_API_KEY")
+        model = os.getenv("CEREBRAS_MODEL")
+        url = "https://api.cerebras.ai/v1/chat/completions"
+
+    elif provider == "openai":
+        key = os.getenv("OPENAI_API_KEY")
+        model = os.getenv("OPENAI_MODEL")
+        url = "https://api.openai.com/v1/chat/completions"
+
+    else:
+        raise RuntimeError(
+            f"Unknown provider: {provider}"
+        )
+
+    if not key:
+        raise RuntimeError(
+            f"{provider} API key is missing"
+        )
+
+    if not model:
+        raise RuntimeError(
+            f"{provider} model is missing"
+        )
+
+    clean_messages = []
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = str(message.get("content", ""))
+
+        if not content:
+            continue
+
+        if role not in ("system", "user", "assistant"):
+            role = "user"
+
+        clean_messages.append(
+            {
+                "role": role,
+                "content": content,
+            }
+        )
+
+    if not clean_messages:
+        raise RuntimeError(
+            f"{provider} received empty messages"
+        )
+
+    payload = {
+        "model": model,
+        "messages": clean_messages,
+    }
+    if provider == "groq" and "gpt-oss" in model:
+        payload["reasoning_effort"] = os.getenv("GROQ_REASONING_EFFORT", "low")
+
+    status, body = await _post(
+        session,
+        url,
+        {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+
+    if status >= 400:
+        raise RuntimeError(
+            f"{provider} HTTP {status}: {body[:500]}"
+        )
+
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"{provider} returned invalid JSON: {body[:500]}"
+        )
+
+    try:
+        answer = data["choices"][0]["message"]["content"]
+
+        if not answer:
+            raise RuntimeError(
+                f"{provider} returned empty answer"
+            )
+
+        return str(answer).strip()
+
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(
+            f"Unexpected {provider} response: {body[:500]}"
+        )
+
+
+def get_provider_order():
+    value = os.getenv(
+        "AI_PROVIDERS",
+        "groq,cerebras,gemini",
+    )
+
+    return [
+        provider.strip().lower()
+        for provider in value.split(",")
+        if provider.strip()
+    ]
+
+
+async def ask_provider(session, provider, messages):
+    print(
+        f"[{provider}] trying...",
+        flush=True,
+    )
+
+    if provider == "gemini":
+        answer = await ask_gemini(
+            session,
+            messages,
+        )
+
+    elif provider == "xkiro":
+        answer = await ask_xkiro(
+            session,
+            messages,
+        )
+
+    elif provider in ("groq", "cerebras", "openai"):
+        answer = await ask_openai_compatible(
+            session,
+            provider,
+            messages,
+        )
+
+    else:
+        raise RuntimeError(
+            f"Unknown provider: {provider}"
+        )
+
+    print(
+        f"[{provider}] OK",
+        flush=True,
+    )
+
+    return answer
+
+
+async def ask(messages):
+    if isinstance(messages, str):
+        messages = [
+            {
+                "role": "user",
+                "content": messages,
+            }
+        ]
+
+    errors = []
+
+    await init_http_session()
+    session = _http_session
+
+    for provider in get_provider_order():
+        try:
+            answer = await ask_provider(
+                session,
+                provider,
+                messages,
+            )
+
+            await _safe_log_provider_attempt(provider, True)
+
+            return {
+                "provider": provider,
+                "answer": answer,
+                "errors": errors,
+            }
+
+        except Exception as e:
+            error = str(e)
+
+            print(
+                f"[{provider}] ERROR: {error}",
+                flush=True,
+            )
+
+            await _safe_log_provider_attempt(provider, False, error)
+
+            errors.append(
+                {
+                    "provider": provider,
+                    "error": error,
+                }
+            )
+
+    raise RuntimeError(
+        "All AI providers failed: "
+        + json.dumps(
+            errors,
+            ensure_ascii=False,
+        )
+    )
+
+
+async def _safe_log_provider_attempt(provider, success, error=None):
+    """
+    Пишет попытку обращения к провайдеру в БД для /status и /stats.
+    Импорт внутри функции — чтобы не создавать цикл импортов на уровне
+    модуля (database.db не должен зависеть от router на старте). Ошибка
+    самого лога не должна портить ответ пользователю, поэтому глушится.
+    """
+    try:
+        from database.db import log_provider_attempt
+        await log_provider_attempt(provider, success, error)
+    except Exception as log_error:
+        print(f"[provider_log] write error: {log_error}", flush=True)
+
+
+async def should_search_web(session, provider, user_text):
+    """
+    Спрашивает у AI, нужен ли для ответа поиск в интернете.
+    Возвращает (need_search: bool, query: str)
+    """
+    system_prompt = (
+        "Ты определяешь, нужен ли для ответа на вопрос пользователя "
+        "поиск актуальной информации в интернете (новости, курсы валют, "
+        "погода, свежие события, факты после 2025 года и т.п.). "
+        "Ответь СТРОГО в формате JSON без каких-либо пояснений: "
+        '{"need_search": true/false, "query": "поисковый запрос на русском или английском"}. '
+        "Если поиск не нужен (общие вопросы, разговор, творчество, код) — "
+        '{"need_search": false, "query": ""}'
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            return False, ""
+
+        raw = raw.strip()
+
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        data = json.loads(raw)
+
+        return bool(data.get("need_search")), str(data.get("query", "")).strip()
+
+    except Exception as e:
+        print(f"[should_search_web] ERROR: {e}", flush=True)
+        return False, ""
+
+
+async def should_play_music(session, provider, user_text):
+    system_prompt = (
+        'Определи, просит ли пользователь включить/найти/скачать музыку или песню. '
+        'Ответь СТРОГО JSON без пояснений: '
+        '{"is_music_request": true/false, "track_query": "название трека и исполнителя для поиска"}. '
+        'Если это не запрос музыки — {"is_music_request": false, "track_query": ""}'
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            return False, ""
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        return bool(data.get("is_music_request")), str(data.get("track_query", "")).strip()
+    except Exception as e:
+        print(f"[should_play_music] ERROR: {e}", flush=True)
+        return False, ""
+
+
+async def should_create_website(session, provider, user_text):
+    system_prompt = (
+        'Определи, просит ли пользователь СОЗДАТЬ веб-сайт, лендинг, '
+        'страницу регистрации/логина, портфолио или любую HTML-страницу. '
+        'Ответь СТРОГО JSON без пояснений: '
+        '{"is_website_request": true/false, "site_description": "краткое описание того, что за сайт нужен"}. '
+        'Если это не запрос на создание сайта — {"is_website_request": false, "site_description": ""}'
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras", "openai"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            return False, ""
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        return bool(data.get("is_website_request")), str(data.get("site_description", "")).strip()
+    except Exception as e:
+        print(f"[should_create_website] ERROR: {e}", flush=True)
+        return False, ""
+
+
+async def generate_website_html(session, provider, description):
+    system_prompt = (
+        "Ты — опытный веб-дизайнер. Создай ПОЛНЫЙ, готовый к использованию "
+        "HTML-файл с современным, красивым дизайном (CSS внутри тега <style>, "
+        "JS внутри тега <script>, всё в одном файле). Используй плавные "
+        "анимации, градиенты, адаптивную вёрстку. Ответь СТРОГО кодом, "
+        "начиная с <!DOCTYPE html>, без пояснений и без markdown-обёртки "
+        "тройными кавычками."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": description},
+    ]
+    if provider == "gemini":
+        raw = await ask_gemini(session, messages)
+    elif provider in ("groq", "cerebras", "openai"):
+        raw = await ask_openai_compatible(session, provider, messages)
+    else:
+        raise RuntimeError(f"Unknown provider: {provider}")
+
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        if raw.startswith("html"):
+            raw = raw[4:]
+        raw = raw.strip()
+    return raw
+
+
+async def check_site_description(session, provider, description):
+    system_prompt = (
+        'Тебе дано краткое описание сайта, который просит сделать пользователь. '
+        'Определи, достаточно ли деталей, чтобы сделать конкретный, осмысленный сайт '
+        '(понятна тематика/ниша, есть хоть какой-то намёк на стиль или назначение), '
+        'или описание слишком скудное (буквально пара слов без какой-либо конкретики, '
+        'например просто "сайт", "лендинг", "сделай сайт"). '
+        'Если тематика понятна (например "сайт одежды в стиле iOS", "лендинг кофейни") — '
+        'этого уже достаточно, sufficient=true, остальное можно додумать самому. '
+        'Если описание крайне скудное — sufficient=false и задай ОДИН короткий '
+        'уточняющий вопрос на русском (какой сайт нужен, для чего, есть ли пожелания '
+        'по стилю/цветам). Ответь СТРОГО JSON без пояснений: '
+        '{"sufficient": true/false, "question": "текст вопроса или пусто"}'
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": description},
+    ]
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras", "openai"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            raise RuntimeError(f"check_site_description: unsupported provider {provider}")
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        return {
+            "sufficient": bool(data.get("sufficient", True)),
+            "question": str(data.get("question", "")).strip(),
+        }
+    except Exception as e:
+        print(f"[check_site_description] {provider} ERROR: {e}", flush=True)
+        raise
+
+
+async def classify_request(session, provider, user_text):
+    system_prompt = (
+        'Проанализируй сообщение пользователя и определи ОДНОВРЕМЕННО три вещи. '
+        'Ответь СТРОГО JSON без пояснений, в формате:\n'
+        '{"is_music_request": true/false, "track_query": "название трека и исполнителя, если это музыка, иначе пусто", '
+        '"is_website_request": true/false, "site_description": "описание сайта, если это запрос на создание сайта, иначе пусто", '
+        '"needs_web_search": true/false, "search_query": "поисковый запрос, если нужен веб-поиск для ответа на вопрос, иначе пусто"}\n'
+        'is_music_request=true только если явно просят включить/найти/скачать музыку или песню. '
+        'is_website_request=true только если явно просят создать сайт, лендинг, страницу регистрации/логина, портфолио. '
+        'needs_web_search=true только если нужна свежая/актуальная информация (новости, курсы, погода, текущие события), '
+        'которую ты не можешь знать заранее. Если сообщение не подходит ни под одну категорию — все флаги false.'
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+    default = {
+        "is_music_request": False,
+        "track_query": "",
+        "is_website_request": False,
+        "site_description": "",
+        "needs_web_search": False,
+        "search_query": "",
+    }
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras", "openai"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            raise RuntimeError(f"classify_request: unsupported provider {provider}")
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        return {
+            "is_music_request": bool(data.get("is_music_request")),
+            "track_query": str(data.get("track_query", "")).strip(),
+            "is_website_request": bool(data.get("is_website_request")),
+            "site_description": str(data.get("site_description", "")).strip(),
+            "needs_web_search": bool(data.get("needs_web_search")),
+            "search_query": str(data.get("search_query", "")).strip(),
+        }
+    except Exception as e:
+        print(f"[classify_request] {provider} ERROR: {e}", flush=True)
+        raise
+
+
+async def classify_is_addressed(session, provider, user_text):
+    system_prompt = (
+        'Тебе дано сообщение из группового Telegram-чата, в котором упоминается '
+        'слово "каспер" или "kasper" (это имя ИИ-бота). Определи: это сообщение '
+        'реально адресовано боту (вопрос к нему, просьба, обращение "каспер, ...", '
+        '"эй каспер" и т.п.) — или это просто упоминание слова в разговоре между '
+        'людьми не по адресу боту (например "капец, он написал умно", "каспер вообще '
+        'красавчик" в переписке о ком-то другом, шутка, обсуждение бота в третьем лице).\n'
+        'Ответь СТРОГО JSON без пояснений: {"addressed_to_bot": true/false}\n'
+        'true — только если сообщение реально требует ответа ИМЕННО от бота. '
+        'В остальных случаях, включая любые сомнения — false.'
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
+    ]
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras", "openai"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            raise RuntimeError(f"classify_is_addressed: unsupported provider {provider}")
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        data = json.loads(raw)
+        return bool(data.get("addressed_to_bot"))
+    except Exception as e:
+        print(f"[classify_is_addressed] {provider} ERROR: {e}", flush=True)
+        raise
+
+
+async def summarize_conversation(session, provider, previous_summary, new_messages_text):
+    """
+    Обновляет "скользящее" саммари разговора: берёт предыдущий пересказ + новый
+    кусок переписки и просит ИИ переписать пересказ так, чтобы он реально
+    отражал СУТЬ разговора, а не был сухим перечнем фактов.
+    """
+    system_prompt = (
+        "Ты ведёшь внутренний конспект разговора для ИИ-ассистента, который "
+        "должен помнить длинную переписку, даже когда в его контекст "
+        "попадают только последние несколько сообщений. Твоя задача — не "
+        "просто перечислить факты, а понять СУТЬ происходящего: что за "
+        "разговор идёт, зачем пользователь это пишет, какой у него тон и "
+        "настроение (шутит, злится, серьёзно занят делом, просто болтает), "
+        "что реально важно помнить дальше, а что было проходной репликой и "
+        "не стоит внимания.\n\n"
+        "Тебе дан ПРЕДЫДУЩИЙ конспект и НОВЫЙ кусок переписки, случившийся "
+        "после него. Перепиши конспект целиком заново, объединив старое и "
+        "новое: сохрани то, что всё ещё актуально, обнови или убери то, что "
+        "устарело или было закрыто/отменено, добавь новое важное. "
+        "Включай: кто такой пользователь и как обращаться (если понятно), "
+        "главную тему или темы разговора, договорённости и незакрытые "
+        "вопросы, важный контекст для будущих ответов (стиль общения, "
+        "шутки/отсылки, которые могут повториться, эмоциональный фон). "
+        "НЕ включай: разовые эмоциональные реакции без развития, точные "
+        "формулировки фраз, техническую воду, повторы. Пиши по-русски, "
+        "простым связным текстом (не списком), 6-8 предложений, без "
+        "вступлений вроде 'Вот конспект' — сразу по делу. Если новый кусок "
+        "переписки не содержит ничего значимого и предыдущий конспект уже "
+        "всё покрывает — можешь оставить его почти без изменений."
+    )
+
+    user_prompt = (
+        f"ПРЕДЫДУЩИЙ КОНСПЕКТ:\n{previous_summary or '(пока пусто, разговор только начинается)'}\n\n"
+        f"НОВЫЙ КУСОК ПЕРЕПИСКИ:\n{new_messages_text}\n\n"
+        "Перепиши конспект целиком с учётом нового куска."
+    )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    try:
+        if provider == "gemini":
+            raw = await ask_gemini(session, messages)
+        elif provider in ("groq", "cerebras", "openai"):
+            raw = await ask_openai_compatible(session, provider, messages)
+        else:
+            raise RuntimeError(f"summarize_conversation: unsupported provider {provider}")
+
+        raw = raw.strip()
+        if raw.startswith("```"):
+            raw = raw.strip("`")
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+
+        return raw
+    except Exception as e:
+        print(f"[summarize_conversation] {provider} ERROR: {e}", flush=True)
+        raise
+
+
+async def ask_xkiro(session, messages):
+    key = os.getenv("XKIRO_API_KEY")
+    model = os.getenv("XKIRO_MODEL", "qwen/qwen3.8-max:free")
+    base_url = os.getenv("XKIRO_BASE_URL", "https://api.xkiro.com/v1").rstrip("/")
+
+    if not key:
+        raise RuntimeError("XKiro API key is missing")
+
+    clean_messages = []
+
+    for message in messages:
+        role = message.get("role", "user")
+        content = str(message.get("content", ""))
+
+        if not content:
+            continue
+
+        if role not in ("system", "user", "assistant"):
+            role = "user"
+
+        clean_messages.append({
+            "role": role,
+            "content": content,
+        })
+
+    if not clean_messages:
+        raise RuntimeError("XKiro received empty messages")
+
+    payload = {
+        "model": model,
+        "messages": clean_messages,
+    }
+
+    status, body = await _post(
+        session,
+        f"{base_url}/chat/completions",
+        {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        },
+        payload,
+    )
+
+    if status >= 400:
+        raise RuntimeError(
+            f"XKiro HTTP {status}: {body[:500]}"
+        )
+
+    try:
+        data = json.loads(body)
+        answer = data["choices"][0]["message"]["content"]
+
+        if not answer:
+            raise RuntimeError("XKiro returned empty answer")
+
+        return str(answer).strip()
+
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError):
+        raise RuntimeError(
+            f"Unexpected XKiro response: {body[:500]}"
+        )
