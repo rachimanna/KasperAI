@@ -110,11 +110,10 @@ async def init_db():
         """
     )
 
-    # Ускоряем самые частые выборки истории/лимитов/игр.
+    # Ускоряем выборки сообщений.
+    # Индексы игровых таблиц создаются ниже, после CREATE TABLE.
     await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_chat_id_id ON messages(chat_id, id)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_messages_user_private ON messages(user_id, id)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_game_players_game_user ON game_players(game_id, user_id)")
-    await db.execute("CREATE INDEX IF NOT EXISTS idx_game_actions_lookup ON game_actions(game_id, phase_number, actor_user_id, action_type)")
 
     # Таблица игр
     await db.execute(
@@ -180,6 +179,16 @@ async def init_db():
             FOREIGN KEY(game_id) REFERENCES games(id)
         )
         """
+    )
+
+    # Индексы игровых таблиц создаём только после создания самих таблиц.
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_game_players_game_user "
+        "ON game_players(game_id, user_id)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_game_actions_lookup "
+        "ON game_actions(game_id, phase_number, actor_user_id, action_type)"
     )
 
     # Таблица попыток обращения к AI-провайдерам (для /status и /stats)
