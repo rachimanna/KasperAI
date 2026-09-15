@@ -1,4 +1,3 @@
-
 import os
 from dotenv import load_dotenv
 
@@ -15,11 +14,17 @@ CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "")
 
 AI_PROVIDERS = [
     p.strip().lower()
-    for p in os.getenv("AI_PROVIDERS", "gemini,groq,cerebras,openai").split(",")
+    for p in os.getenv("AI_PROVIDERS", "groq,cerebras,gemini").split(",")
     if p.strip()
 ]
 
-DATABASE_PATH = os.getenv("DATABASE_PATH", "data/kasper.db")
+# Единый источник истины для SQLite. DATABASE_PATH имеет приоритет,
+# DB_PATH оставлен для обратной совместимости со старым Render env.
+DATABASE_PATH = (
+    os.getenv("DATABASE_PATH")
+    or os.getenv("DB_PATH")
+    or "data/kasper.db"
+)
 
 # Telegram ID администраторов бота. Поддерживаются оба варианта:
 # ADMIN_ID=123456789 (один айди, уже мог быть задан на Render)
