@@ -5,18 +5,28 @@
   1. Telegram voice → скачать .ogg
   2. Groq Whisper API → распознать текст (STT)
   3. router/ai_router.ask() → ответ Каспера
-  4. edge-tts → синтез речи .mp3 (TTS), живой нейросетевой голос,
-     бесплатно и без API-ключа
+  4. Silero TTS → синтез речи .mp3 (TTS). Модель работает ЛОКАЛЬНО,
+     внутри процесса бота — никуда наружу не стучится (в отличие от
+     edge-tts/gTTS), поэтому её не может заблокировать сторонний сервис.
+     Бесплатно, без API-ключа.
   5. Отправить voice note в чат
+
+Важно: при первом запуске Silero скачивает саму модель (~50 МБ) с
+GitHub — это происходит один раз при первом голосовом сообщении после
+деплоя/рестарта и может занять до минуты. Дальше модель уже в памяти
+процесса и ответы быстрые.
 """
 
 import os
 import io
-import tempfile
+import wave
+import asyncio
 import logging
+import subprocess
 
 import aiohttp
-import edge_tts
+import numpy as np
+import imageio_ffmpeg
 
 from router.ai_router import get_provider_order
 
@@ -77,35 +87,75 @@ async def transcribe_voice(ogg_bytes: bytes) -> str:
             return text
 
 
-# Голос по умолчанию — мужской, живой, под дерзкий характер Каспера.
-# Другие варианты русских нейро-голосов edge-tts:
-#   "ru-RU-SvetlanaNeural"  — женский, тёплый
-#   "ru-RU-DmitryNeural"    — мужской (используется сейчас)
-VOICE_NAME = "ru-RU-DmitryNeural"
+# Голос по умолчанию — мужской, уверенный, под дерзкий характер Каспера.
+# Другие варианты русских голосов Silero v4 (модель "v4_ru"):
+#   "aidar"   — мужской, энергичный (используется сейчас)
+#   "eugene"  — мужской, более низкий и спокойный
+#   "baya"    — женский
+#   "kseniya" — женский, мягкий
+#   "xenia"   — женский
+SPEAKER = "aidar"
+SAMPLE_RATE = 48000
 
-# Небольшая прибавка скорости и лёгкое понижение тона — звучит увереннее
-# и меньше похоже на дефолтный "читающий текст" голос.
-VOICE_RATE = "+8%"
-VOICE_PITCH = "-2Hz"
+_model = None  # модель Silero, грузится один раз лениво при первом сообщении
 
 
-async def synthesize_speech(text: str, voice: str = VOICE_NAME) -> bytes:
-    """
-    Синтезирует речь через edge-tts (нейросетевые голоса Microsoft Edge).
-    Бесплатно, без API-ключа, звучит естественно — не как робот.
-    """
-    communicate = edge_tts.Communicate(
-        text,
-        voice=voice,
-        rate=VOICE_RATE,
-        pitch=VOICE_PITCH,
+def _load_model():
+    global _model
+    if _model is None:
+        import torch
+        torch.set_num_threads(4)
+        log.info("[voice] загружаю модель Silero TTS (один раз)...")
+        model, _ = torch.hub.load(
+            repo_or_dir="snakers4/silero-models",
+            model="silero_tts",
+            language="ru",
+            speaker="v4_ru",
+            trust_repo=True,
+        )
+        model.to(torch.device("cpu"))
+        _model = model
+        log.info("[voice] модель Silero TTS загружена")
+    return _model
+
+
+def _wav_to_mp3(wav_bytes: bytes) -> bytes:
+    """Конвертирует WAV в MP3 через ffmpeg (уже есть в зависимостях как imageio-ffmpeg)."""
+    ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+    proc = subprocess.run(
+        [ffmpeg_path, "-y", "-i", "pipe:0", "-f", "mp3", "pipe:1"],
+        input=wav_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg error: {proc.stderr.decode(errors='ignore')}")
+    return proc.stdout
+
+
+def _synthesize_sync(text: str, speaker: str) -> bytes:
+    model = _load_model()
+    audio = model.apply_tts(text=text, speaker=speaker, sample_rate=SAMPLE_RATE)
+    pcm16 = (audio.numpy() * 32767).astype(np.int16)
+
     buf = io.BytesIO()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            buf.write(chunk["data"])
-    buf.seek(0)
-    return buf.read()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(SAMPLE_RATE)
+        wf.writeframes(pcm16.tobytes())
+
+    return _wav_to_mp3(buf.getvalue())
+
+
+async def synthesize_speech(text: str, speaker: str = SPEAKER) -> bytes:
+    """
+    Синтезирует речь через локальную модель Silero TTS.
+    Бесплатно, без API-ключа, ничего не отправляет наружу — работает,
+    даже если внешние TTS-сервисы блокируют запросы с сервера.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _synthesize_sync, text, speaker)
 
 
 async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_message_fn, user_id, chat_id=None):
