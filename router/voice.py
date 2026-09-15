@@ -98,6 +98,7 @@ SPEAKER = "aidar"
 SAMPLE_RATE = 48000
 
 _model = None  # модель Silero, грузится один раз лениво при первом сообщении
+_tts_lock = asyncio.Lock()
 
 
 def _load_model():
@@ -149,13 +150,12 @@ def _synthesize_sync(text: str, speaker: str) -> bytes:
 
 
 async def synthesize_speech(text: str, speaker: str = SPEAKER) -> bytes:
-    """
-    Синтезирует речь через локальную модель Silero TTS.
-    Бесплатно, без API-ключа, ничего не отправляет наружу — работает,
-    даже если внешние TTS-сервисы блокируют запросы с сервера.
-    """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _synthesize_sync, text, speaker)
+    """Синтезирует речь с ограничением параллельных TTS-задач."""
+    if not text or not text.strip():
+        raise ValueError("TTS text is empty")
+    async with _tts_lock:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _synthesize_sync, text.strip(), speaker)
 
 
 async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_message_fn, user_id, chat_id=None):
@@ -216,7 +216,10 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
         if role and content:
             messages.append({"role": role, "content": content})
 
-    messages.append({"role": "user", "content": recognized_text})
+    # recognized_text уже сохранён в БД и присутствует в history.
+    # Не добавляем его второй раз — иначе модель получает дубль последнего сообщения.
+    if not history or history[-1][0] != "user" or history[-1][1] != recognized_text:
+        messages.append({"role": "user", "content": recognized_text})
 
     # 4. Получаем ответ AI
     ai_response = None
