@@ -1,4 +1,3 @@
-```python
 """
 UI-клавиатуры для AI-агента Kasper AI.
 
@@ -47,4 +46,3 @@ def stop_keyboard() -> InlineKeyboardMarkup:
     )
 
     return keyboard
-```
