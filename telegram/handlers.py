@@ -459,12 +459,11 @@ async def cmd_help(message: types.Message):
     )
 
 async def cmd_limit(message: types.Message):
-    from database.db import ADMIN_TELEGRAM_IDS
     user_id = await get_or_create_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
     )
-    if message.from_user.id in ADMIN_TELEGRAM_IDS:
+    if message.from_user.id in ADMIN_IDS:
         await message.answer("👑 Вы админ — лимит безлимитный.")
         return
     used, remaining = await get_limit_status(user_id, daily_limit=20)
