@@ -32,7 +32,12 @@ WHISPER_MODEL = "whisper-large-v3-turbo"
 
 SPEAKER = "aidar"
 SAMPLE_RATE = 24000
+
+DOWNLOAD_TIMEOUT = 30
+STT_TIMEOUT = 30
+AI_TIMEOUT = 60
 TTS_TIMEOUT = 60
+FFMPEG_TIMEOUT = 30
 
 _model = None
 _model_error = None
@@ -40,8 +45,13 @@ _model_lock = threading.Lock()
 _tts_lock = asyncio.Lock()
 
 
+# =========================================================
+# SILERO
+# =========================================================
+
 def _load_model():
     """Загружает Silero один раз."""
+
     global _model
     global _model_error
 
@@ -49,6 +59,7 @@ def _load_model():
         return _model
 
     with _model_lock:
+
         if _model is not None:
             return _model
 
@@ -61,7 +72,9 @@ def _load_model():
             cpu_count = os.cpu_count() or 1
 
             try:
-                torch.set_num_threads(min(4, cpu_count))
+                torch.set_num_threads(
+                    min(4, cpu_count)
+                )
             except Exception:
                 pass
 
@@ -70,7 +83,9 @@ def _load_model():
             except Exception:
                 pass
 
-            log.info("[voice] Silero: начинаю загрузку модели...")
+            log.info(
+                "[voice] Silero: начинаю загрузку модели..."
+            )
 
             model, _ = torch.hub.load(
                 repo_or_dir="snakers4/silero-models",
@@ -80,20 +95,27 @@ def _load_model():
                 trust_repo=True,
             )
 
-            model.to(torch.device("cpu"))
+            model.to(
+                torch.device("cpu")
+            )
 
-            # НЕ вызываем model.eval().
-            # TTSModelMultiAcc_v3 не является обычным nn.Module
-            # и у него нет метода eval().
+            # ВАЖНО:
+            # model.eval() здесь НЕ вызываем.
+            # TTSModelMultiAcc_v3 не имеет eval().
 
             _model = model
 
-            log.info("[voice] Silero: модель успешно загружена")
+            log.info(
+                "[voice] Silero: модель успешно загружена"
+            )
 
             return _model
 
         except Exception as exc:
-            _model_error = f"Silero model error: {exc}"
+
+            _model_error = (
+                f"Silero model error: {exc}"
+            )
 
             log.exception(
                 "[voice] %s",
@@ -104,17 +126,19 @@ def _load_model():
 
 
 def _warmup_model():
-    """Загружает модель сразу после старта бота."""
+    """Загружает Silero сразу после старта."""
+
     try:
+
         _load_model()
 
     except Exception:
+
         log.exception(
             "[voice] Silero warmup failed"
         )
 
 
-# Загружаем Silero сразу после импорта модуля.
 threading.Thread(
     target=_warmup_model,
     name="silero-warmup",
@@ -122,24 +146,36 @@ threading.Thread(
 ).start()
 
 
+# =========================================================
+# TELEGRAM DOWNLOAD
+# =========================================================
+
 async def download_voice(
     bot,
     file_id: str,
 ) -> bytes:
     """Скачивает голосовое сообщение из Telegram."""
 
-    file = await bot.get_file(file_id)
+    log.info(
+        "[voice] downloading Telegram voice..."
+    )
+
+    file = await asyncio.wait_for(
+        bot.get_file(file_id),
+        timeout=DOWNLOAD_TIMEOUT,
+    )
+
     file_path = file.file_path
 
     token = bot._token
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"file/bot{token}/{file_path}"
     )
 
     timeout = aiohttp.ClientTimeout(
-        total=30
+        total=DOWNLOAD_TIMEOUT
     )
 
     async with aiohttp.ClientSession(
@@ -147,9 +183,22 @@ async def download_voice(
     ) as session:
 
         async with session.get(url) as resp:
-            resp.raise_for_status()
-            return await resp.read()
 
+            resp.raise_for_status()
+
+            data = await resp.read()
+
+    log.info(
+        "[voice] downloaded voice: %s bytes",
+        len(data),
+    )
+
+    return data
+
+
+# =========================================================
+# GROQ WHISPER
+# =========================================================
 
 async def transcribe_voice(
     ogg_bytes: bytes,
@@ -195,7 +244,11 @@ async def transcribe_voice(
     )
 
     timeout = aiohttp.ClientTimeout(
-        total=30
+        total=STT_TIMEOUT
+    )
+
+    log.info(
+        "[voice] sending audio to Groq Whisper..."
     )
 
     async with aiohttp.ClientSession(
@@ -209,6 +262,7 @@ async def transcribe_voice(
         ) as resp:
 
             if resp.status != 200:
+
                 body = await resp.text()
 
                 raise RuntimeError(
@@ -218,11 +272,17 @@ async def transcribe_voice(
 
             result = await resp.json()
 
-            return result.get(
-                "text",
-                "",
-            ).strip()
+    text = result.get(
+        "text",
+        "",
+    ).strip()
 
+    return text
+
+
+# =========================================================
+# WAV → MP3
+# =========================================================
 
 def _wav_to_mp3(
     wav_bytes: bytes,
@@ -252,27 +312,38 @@ def _wav_to_mp3(
         input=wav_bytes,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        timeout=30,
+        timeout=FFMPEG_TIMEOUT,
     )
 
     if proc.returncode != 0:
+
+        error_text = proc.stderr.decode(
+            errors="ignore"
+        )
+
         raise RuntimeError(
-            "ffmpeg error: "
-            + proc.stderr.decode(
-                errors="ignore"
-            )
+            f"ffmpeg error: {error_text}"
         )
 
     return proc.stdout
 
 
+# =========================================================
+# SILERO SYNTHESIS
+# =========================================================
+
 def _synthesize_sync(
     text: str,
     speaker: str,
 ) -> bytes:
-    """Синтезирует речь."""
+    """Синтезирует речь в отдельном executor."""
 
     model = _load_model()
+
+    log.info(
+        "[voice] TTS: начинаю синтез, %s chars",
+        len(text),
+    )
 
     audio = model.apply_tts(
         text=text,
@@ -305,16 +376,23 @@ def _synthesize_sync(
             pcm16.tobytes()
         )
 
-    return _wav_to_mp3(
+    mp3 = _wav_to_mp3(
         buffer.getvalue()
     )
+
+    log.info(
+        "[voice] TTS: готово, %s bytes",
+        len(mp3),
+    )
+
+    return mp3
 
 
 async def synthesize_speech(
     text: str,
     speaker: str = SPEAKER,
 ) -> bytes:
-    """Синтезирует голос."""
+    """Асинхронный TTS."""
 
     text = (
         text or ""
@@ -332,7 +410,8 @@ async def synthesize_speech(
         )
 
         try:
-            return await asyncio.wait_for(
+
+            result = await asyncio.wait_for(
                 loop.run_in_executor(
                     None,
                     _synthesize_sync,
@@ -341,6 +420,8 @@ async def synthesize_speech(
                 ),
                 timeout=TTS_TIMEOUT,
             )
+
+            return result
 
         except asyncio.TimeoutError:
 
@@ -355,6 +436,41 @@ async def synthesize_speech(
             )
 
 
+# =========================================================
+# HISTORY HELPERS
+# =========================================================
+
+def _get_history_row(
+    row,
+):
+    """
+    Унифицированно получает role/content
+    как из tuple, так и из dict.
+    """
+
+    if isinstance(row, dict):
+
+        return (
+            row.get("role"),
+            row.get("content"),
+        )
+
+    if isinstance(row, (tuple, list)):
+
+        if len(row) >= 2:
+
+            return (
+                row[0],
+                row[1],
+            )
+
+    return None, None
+
+
+# =========================================================
+# MAIN VOICE HANDLER
+# =========================================================
+
 async def handle_voice_message(
     bot,
     message,
@@ -366,9 +482,13 @@ async def handle_voice_message(
 ):
     """Полный цикл обработки голосового."""
 
-    # ---------------------------------------------------------
-    # 1. Скачать голосовое
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 1. DOWNLOAD
+    # -----------------------------------------------------
+
+    log.info(
+        "[voice] step 1/6: download"
+    )
 
     try:
 
@@ -379,7 +499,7 @@ async def handle_voice_message(
 
     except Exception as exc:
 
-        log.error(
+        log.exception(
             "[voice] download error: %s",
             exc,
         )
@@ -391,9 +511,13 @@ async def handle_voice_message(
 
         return
 
-    # ---------------------------------------------------------
-    # 2. Распознать
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 2. STT
+    # -----------------------------------------------------
+
+    log.info(
+        "[voice] step 2/6: speech-to-text"
+    )
 
     try:
 
@@ -405,7 +529,7 @@ async def handle_voice_message(
 
     except Exception as exc:
 
-        log.error(
+        log.exception(
             "[voice] STT error: %s",
             exc,
         )
@@ -436,22 +560,48 @@ async def handle_voice_message(
         parse_mode="Markdown",
     )
 
-    # ---------------------------------------------------------
-    # 3. История
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 3. HISTORY
+    # -----------------------------------------------------
 
-    await save_message_fn(
-        user_id,
-        "user",
-        recognized_text,
-        chat_id=chat_id,
+    log.info(
+        "[voice] step 3/6: history"
     )
 
-    history = await get_history_fn(
-        user_id,
-        limit=5,
-        chat_id=chat_id,
-    )
+    try:
+
+        await save_message_fn(
+            user_id,
+            "user",
+            recognized_text,
+            chat_id=chat_id,
+        )
+
+        history = await get_history_fn(
+            user_id,
+            limit=5,
+            chat_id=chat_id,
+        )
+
+    except Exception as exc:
+
+        log.exception(
+            "[voice] history error: %s",
+            exc,
+        )
+
+        await message.answer(
+            "⚠️ Ошибка истории диалога."
+        )
+
+        return
+
+    if history is None:
+        history = []
+
+    # -----------------------------------------------------
+    # SYSTEM PROMPT
+    # -----------------------------------------------------
 
     system_prompt = (
         "Ты — Kasper AI, ИИ-помощник в Telegram "
@@ -474,17 +624,16 @@ async def handle_voice_message(
         }
     ]
 
+    # -----------------------------------------------------
+    # HISTORY → MESSAGES
+    # -----------------------------------------------------
+
+    last_role = None
+    last_content = None
+
     for row in history:
 
-        if isinstance(row, dict):
-
-            role = row.get("role")
-            content = row.get("content")
-
-        else:
-
-            role = row[0]
-            content = row[1]
+        role, content = _get_history_row(row)
 
         if role and content:
 
@@ -495,11 +644,16 @@ async def handle_voice_message(
                 }
             )
 
-    # Не дублируем последнее сообщение.
-    if (
-        not history
-        or history[-1][0] != "user"
-        or history[-1][1] != recognized_text
+            last_role = role
+            last_content = content
+
+    # -----------------------------------------------------
+    # НЕ ДУБЛИРУЕМ ПОСЛЕДНЕЕ USER MESSAGE
+    # -----------------------------------------------------
+
+    if not (
+        last_role == "user"
+        and last_content == recognized_text
     ):
 
         messages.append(
@@ -509,41 +663,74 @@ async def handle_voice_message(
             }
         )
 
-    # ---------------------------------------------------------
+    log.info(
+        "[voice] history ready: %s messages",
+        len(messages),
+    )
+
+    # -----------------------------------------------------
     # 4. AI
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+
+    log.info(
+        "[voice] step 4/6: AI"
+    )
 
     ai_response = None
 
-    timeout = aiohttp.ClientTimeout(
-        total=60
-    )
+    try:
 
-    async with aiohttp.ClientSession(
-        timeout=timeout
-    ) as session:
+        timeout = aiohttp.ClientTimeout(
+            total=AI_TIMEOUT
+        )
 
-        for provider in get_provider_order():
+        async with aiohttp.ClientSession(
+            timeout=timeout
+        ) as session:
 
-            try:
+            for provider in get_provider_order():
 
-                ai_response = await ai_ask_fn(
-                    session,
+                log.info(
+                    "[voice] trying AI provider: %s",
                     provider,
-                    messages,
                 )
 
-                if ai_response:
-                    break
+                try:
 
-            except Exception as exc:
+                    ai_response = await asyncio.wait_for(
+                        ai_ask_fn(
+                            session,
+                            provider,
+                            messages,
+                        ),
+                        timeout=AI_TIMEOUT,
+                    )
 
-                log.error(
-                    "[voice] AI provider %s "
-                    "error: %s",
-                    provider,
-                    exc,
-                )
+                    if ai_response:
+
+                        log.info(
+                            "[voice] AI response "
+                            "received from %s",
+                            provider,
+                        )
+
+                        break
+
+                except Exception as exc:
+
+                    log.exception(
+                        "[voice] AI provider %s "
+                        "error: %s",
+                        provider,
+                        exc,
+                    )
+
+    except Exception as exc:
+
+        log.exception(
+            "[voice] AI fatal error: %s",
+            exc,
+        )
 
     if not ai_response:
 
@@ -554,16 +741,37 @@ async def handle_voice_message(
 
         return
 
-    await save_message_fn(
-        user_id,
-        "assistant",
-        ai_response,
-        chat_id=chat_id,
-    )
+    ai_response = str(
+        ai_response
+    ).strip()
 
-    # ---------------------------------------------------------
-    # 5. Silero TTS
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # SAVE AI RESPONSE
+    # -----------------------------------------------------
+
+    try:
+
+        await save_message_fn(
+            user_id,
+            "assistant",
+            ai_response,
+            chat_id=chat_id,
+        )
+
+    except Exception as exc:
+
+        log.exception(
+            "[voice] save AI response error: %s",
+            exc,
+        )
+
+    # -----------------------------------------------------
+    # 5. TTS
+    # -----------------------------------------------------
+
+    log.info(
+        "[voice] step 5/6: TTS"
+    )
 
     try:
 
@@ -575,22 +783,26 @@ async def handle_voice_message(
 
     except Exception as exc:
 
-        log.error(
+        log.exception(
             "[voice] TTS error: %s",
             exc,
         )
 
-        # Если голос не получился,
-        # всё равно отдаём ответ текстом.
+        # AI ответ уже есть —
+        # отдаём его текстом.
         await message.answer(
             ai_response
         )
 
         return
 
-    # ---------------------------------------------------------
-    # 6. Отправить голос
-    # ---------------------------------------------------------
+    # -----------------------------------------------------
+    # 6. SEND VOICE
+    # -----------------------------------------------------
+
+    log.info(
+        "[voice] step 6/6: sending voice"
+    )
 
     try:
 
@@ -605,9 +817,13 @@ async def handle_voice_message(
             voice_file
         )
 
+        log.info(
+            "[voice] voice response sent successfully"
+        )
+
     except Exception as exc:
 
-        log.error(
+        log.exception(
             "[voice] send voice error: %s",
             exc,
         )
