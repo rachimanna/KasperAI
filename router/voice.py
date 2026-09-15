@@ -5,7 +5,8 @@
   1. Telegram voice → скачать .ogg
   2. Groq Whisper API → распознать текст (STT)
   3. router/ai_router.ask() → ответ Каспера
-  4. gTTS → синтез речи .mp3 (TTS)
+  4. edge-tts → синтез речи .mp3 (TTS), живой нейросетевой голос,
+     бесплатно и без API-ключа
   5. Отправить voice note в чат
 """
 
@@ -15,7 +16,7 @@ import tempfile
 import logging
 
 import aiohttp
-from gtts import gTTS
+import edge_tts
 
 from router.ai_router import get_provider_order
 
@@ -76,14 +77,33 @@ async def transcribe_voice(ogg_bytes: bytes) -> str:
             return text
 
 
-def synthesize_speech(text: str, lang: str = "ru") -> bytes:
+# Голос по умолчанию — мужской, живой, под дерзкий характер Каспера.
+# Другие варианты русских нейро-голосов edge-tts:
+#   "ru-RU-SvetlanaNeural"  — женский, тёплый
+#   "ru-RU-DmitryNeural"    — мужской (используется сейчас)
+VOICE_NAME = "ru-RU-DmitryNeural"
+
+# Небольшая прибавка скорости и лёгкое понижение тона — звучит увереннее
+# и меньше похоже на дефолтный "читающий текст" голос.
+VOICE_RATE = "+8%"
+VOICE_PITCH = "-2Hz"
+
+
+async def synthesize_speech(text: str, voice: str = VOICE_NAME) -> bytes:
     """
-    Синтезирует речь через gTTS и возвращает mp3-байты.
-    gTTS — бесплатно, без ключей, хорошо говорит по-русски.
+    Синтезирует речь через edge-tts (нейросетевые голоса Microsoft Edge).
+    Бесплатно, без API-ключа, звучит естественно — не как робот.
     """
-    tts = gTTS(text=text, lang=lang, slow=False)
+    communicate = edge_tts.Communicate(
+        text,
+        voice=voice,
+        rate=VOICE_RATE,
+        pitch=VOICE_PITCH,
+    )
     buf = io.BytesIO()
-    tts.write_to_fp(buf)
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            buf.write(chunk["data"])
     buf.seek(0)
     return buf.read()
 
@@ -171,7 +191,7 @@ async def handle_voice_message(bot, message, ai_ask_fn, get_history_fn, save_mes
 
     # 5. TTS — синтезируем речь
     try:
-        mp3_bytes = synthesize_speech(ai_response)
+        mp3_bytes = await synthesize_speech(ai_response)
     except Exception as e:
         log.error(f"[voice] TTS error: {e}")
         await message.answer(ai_response)
