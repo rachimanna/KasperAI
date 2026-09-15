@@ -29,6 +29,7 @@ from router.ai_router import (
     generate_website_html,
 )
 from router.web_search import tavily_search, format_search_results
+from database.db import check_and_increment_agent_limit as db_check_and_increment_agent_limit
 
 
 MAX_STEPS = 7
@@ -40,9 +41,6 @@ STEP_TIMEOUT_SECONDS = 40
 # по стоимости эквивалентен нескольким обычным AI-запросам (план + шаги
 # + синтез финального ответа).
 AGENT_DAILY_LIMIT = int(os.getenv("AGENT_DAILY_LIMIT", "15"))
-
-# {user_id: {"day": "YYYY-MM-DD", "count": int}}
-_AGENT_USAGE = {}
 
 # {user_id: {"task": str, "plan": list[dict], "status": str,
 #            "results": list[dict], "created_at": float}}
@@ -132,25 +130,10 @@ def _today_str():
     return time.strftime("%Y-%m-%d", time.gmtime())
 
 
-def check_and_increment_agent_limit(user_id: int):
-    """
-    Простой дневной лимит на количество запусков агента, отдельно от
-    обычного лимита сообщений — хранится в памяти, сбрасывается по UTC-дате
-    (как и общий процесс бота: переживать рестарт Render не обязано, это
-    не критичный для целостности данных счётчик).
-    """
-    today = _today_str()
-    entry = _AGENT_USAGE.get(user_id)
-
-    if not entry or entry["day"] != today:
-        entry = {"day": today, "count": 0}
-        _AGENT_USAGE[user_id] = entry
-
-    if entry["count"] >= AGENT_DAILY_LIMIT:
-        return False, 0
-
-    entry["count"] += 1
-    return True, AGENT_DAILY_LIMIT - entry["count"]
+async def check_and_increment_agent_limit(user_id: int):
+    return await db_check_and_increment_agent_limit(
+        user_id, daily_limit=AGENT_DAILY_LIMIT
+    )
 
 
 def _strip_json_fences(raw: str) -> str:
