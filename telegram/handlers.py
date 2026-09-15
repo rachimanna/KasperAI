@@ -569,17 +569,21 @@ async def handle_new_chat_members(message: types.Message):
         )
     await message.answer(answer)
 
-async def _animate_kasper(message):
-    frames = ["✦ Kasper", "✧ Kasper", "· Kasper", "✧ Kasper"]
-    i = 0
+async def _animate_kasper(message, started_at):
+    """
+    Имитирует индикатор "thinking" (как в клиентах Claude): пока идёт
+    запрос к AI, раз в секунду обновляет "⏳ thinking ... Ns" с растущим
+    счётчиком. Финальная заморозка в "⏳ Подумал N сек." делается уже
+    в handle_message после того, как ответ готов.
+    """
     try:
         while True:
+            elapsed = int(asyncio.get_event_loop().time() - started_at)
             try:
-                await message.edit_text(frames[i % len(frames)])
+                await message.edit_text(f"⏳ thinking ... {elapsed}s")
             except Exception:
                 pass
-            i += 1
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(1)
     except asyncio.CancelledError:
         pass
 
@@ -647,6 +651,7 @@ async def handle_message(message: types.Message):
 
     animation_message = None
     animation_task = None
+    animation_started_at = None
 
     is_reply_to_bot = False
     if is_group and message.reply_to_message:
@@ -906,8 +911,9 @@ async def handle_message(message: types.Message):
         print(f"[Kasper] Sending {len(messages)} messages to router...", flush=True)
 
         if not is_group:
-            animation_message = await message.answer("✦ Kasper")
-            animation_task = asyncio.create_task(_animate_kasper(animation_message))
+            animation_started_at = asyncio.get_event_loop().time()
+            animation_message = await message.answer("⏳ thinking ... 0s")
+            animation_task = asyncio.create_task(_animate_kasper(animation_message, animation_started_at))
 
         result = await ask(messages)
 
@@ -947,13 +953,15 @@ async def handle_message(message: types.Message):
                 pass
 
         if animation_message:
+            think_seconds = max(1, round(asyncio.get_event_loop().time() - animation_started_at))
             try:
-                await animation_message.edit_text(answer, parse_mode="Markdown")
+                await animation_message.edit_text(f"⏳ Подумал {think_seconds} сек.")
             except Exception:
-                try:
-                    await animation_message.edit_text(answer)
-                except Exception:
-                    await message.answer(answer)
+                pass
+            try:
+                await message.answer(answer, parse_mode="Markdown")
+            except Exception:
+                await message.answer(answer)
         elif is_group:
             try:
                 await message.reply(answer, parse_mode="Markdown")
