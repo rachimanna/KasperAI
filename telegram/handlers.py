@@ -119,7 +119,7 @@ def _pop_awaiting_agent_input(user_id: int) -> bool:
     return time.time() < expires_at
 
 async def _start_agent_flow(message: types.Message, user_id: int, task_text: str):
-    allowed, remaining = check_and_increment_agent_limit(user_id)
+    allowed, remaining = await check_and_increment_agent_limit(user_id)
     if not allowed:
         await message.answer(
             f"⛔ Лимит запусков агента на сегодня исчерпан ({AGENT_DAILY_LIMIT} в день). "
