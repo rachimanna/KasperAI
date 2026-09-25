@@ -24,11 +24,13 @@ import time
 import aiohttp
 
 from router.ai_router import (
+    extract_json,
     ask_provider,
     get_provider_order,
     generate_website_html,
 )
 from router.web_search import tavily_search, format_search_results
+from router.time_awareness import now_in, format_dt_ru
 from database.db import check_and_increment_agent_limit as db_check_and_increment_agent_limit
 
 
@@ -116,14 +118,24 @@ async def is_actual_task(session, provider, user_text: str) -> bool:
             {"role": "user", "content": user_text},
         ]
         raw = await ask_provider(session, provider, messages)
-        raw = _strip_json_fences(raw)
-        data = json.loads(raw)
+        data = extract_json(raw)
         return bool(data.get("is_task", True))
     except Exception as e:
         print(f"[agent] is_actual_task {provider} ERROR: {e}", flush=True)
         # При сбое классификатора не блокируем пользователя — считаем задачей,
         # как было в исходном поведении до этого фикса.
         return True
+
+
+def _date_note():
+    """
+    Модель не знает сегодняшнюю дату: без этого поисковые запросы вида
+    «последние новости» строились под год из её обучения.
+    """
+    return (
+        f"\n\nСегодня {format_dt_ru(now_in())}. Для свежих событий, цен и "
+        "новостей указывай в поисковых запросах текущий год/месяц."
+    )
 
 
 def _today_str():
@@ -176,15 +188,14 @@ PLAN_SYSTEM_PROMPT = (
 
 async def build_plan(session, provider, task_text: str) -> dict:
     messages = [
-        {"role": "system", "content": PLAN_SYSTEM_PROMPT},
+        {"role": "system", "content": PLAN_SYSTEM_PROMPT + _date_note()},
         {"role": "user", "content": task_text},
     ]
 
     raw = await ask_provider(session, provider, messages)
-    raw = _strip_json_fences(raw)
 
     try:
-        data = json.loads(raw)
+        data = extract_json(raw)
     except json.JSONDecodeError as e:
         raise AgentError(f"Планировщик вернул невалидный JSON: {e}") from e
 
@@ -231,8 +242,7 @@ async def should_use_agent(session, provider, user_text: str) -> bool:
     ]
     try:
         raw = await ask_provider(session, provider, messages)
-        raw = _strip_json_fences(raw)
-        data = json.loads(raw)
+        data = extract_json(raw)
         return bool(data.get("is_agent_task"))
     except Exception as e:
         print(f"[agent] should_use_agent {provider} ERROR: {e}", flush=True)
@@ -340,7 +350,7 @@ async def _execute_answer_step(agent_session, task_text: str, collected: list) -
     )
 
     messages = [
-        {"role": "system", "content": ANSWER_SYSTEM_PROMPT},
+        {"role": "system", "content": ANSWER_SYSTEM_PROMPT + _date_note()},
         {"role": "user", "content": user_content},
     ]
 

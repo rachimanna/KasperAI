@@ -20,6 +20,7 @@ setuptools==84.0.0
 wheel==0.48.0
 yarl==1.24.5
 yt-dlp==2026.8.19
+tzdata>=2024.1
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.5.0
 numpy==2.1.3

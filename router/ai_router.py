@@ -1,5 +1,6 @@
 import json
 import os
+import re
 
 import aiohttp
 from dotenv import load_dotenv
@@ -63,18 +64,28 @@ async def ask_gemini(session, messages):
         raise RuntimeError("Gemini model is missing")
 
     contents = []
+    system_parts = []
 
     for message in messages:
         role = message.get("role", "user")
-
-        if role == "assistant":
-            role = "model"
-        else:
-            role = "user"
-
         content = str(message.get("content", ""))
 
         if not content:
+            continue
+
+        # БАГ: раньше system-сообщения уходили в Gemini как обычные реплики
+        # пользователя — характер Каспера и служебные инструкции модель
+        # воспринимала как слова юзера. У Gemini для этого есть отдельное
+        # поле systemInstruction.
+        if role == "system":
+            system_parts.append(content)
+            continue
+
+        role = "model" if role == "assistant" else "user"
+
+        # Gemini не любит две реплики одной роли подряд — склеиваем.
+        if contents and contents[-1]["role"] == role:
+            contents[-1]["parts"][0]["text"] += "\n\n" + content
             continue
 
         contents.append(
@@ -99,6 +110,11 @@ async def ask_gemini(session, messages):
     payload = {
         "contents": contents,
     }
+
+    if system_parts:
+        payload["systemInstruction"] = {
+            "parts": [{"text": "\n\n".join(system_parts)}],
+        }
 
     status, body = await _post(
         session,
@@ -235,11 +251,6 @@ async def ask_openai_compatible(session, provider, messages):
         model = os.getenv("CEREBRAS_MODEL")
         url = "https://api.cerebras.ai/v1/chat/completions"
 
-    elif provider == "cerebras":
-        key = os.getenv("CEREBRAS_API_KEY")
-        model = os.getenv("CEREBRAS_MODEL")
-        url = "https://api.cerebras.ai/v1/chat/completions"
-
     elif provider == "openai":
         key = os.getenv("OPENAI_API_KEY")
         model = os.getenv("OPENAI_MODEL")
@@ -327,6 +338,35 @@ async def ask_openai_compatible(session, provider, messages):
         raise RuntimeError(
             f"Unexpected {provider} response: {body[:500]}"
         )
+
+
+def _today_note():
+    try:
+        from router.time_awareness import now_in, format_dt_ru
+        return f"\nСегодня: {format_dt_ru(now_in())}."
+    except Exception:
+        return ""
+
+
+def extract_json(raw):
+    """
+    Достаёт JSON-объект из ответа модели. Модели часто оборачивают JSON в
+    ```json ...``` или добавляют фразу до/после — раньше json.loads падал,
+    и классификаторы (музыка/сайт/поиск) молча переставали работать.
+    """
+    text = str(raw or "").strip()
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        return json.loads(text[start:end + 1])
+    raise json.JSONDecodeError("no JSON object in model answer", text, 0)
 
 
 def get_provider_order():
@@ -471,22 +511,9 @@ async def should_search_web(session, provider, user_text):
     ]
 
     try:
-        if provider == "gemini":
-            raw = await ask_gemini(session, messages)
-        elif provider in ("groq", "cerebras"):
-            raw = await ask_openai_compatible(session, provider, messages)
-        else:
-            return False, ""
+        raw = await ask_provider(session, provider, messages)
 
-        raw = raw.strip()
-
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-
-        data = json.loads(raw)
+        data = extract_json(raw)
 
         return bool(data.get("need_search")), str(data.get("query", "")).strip()
 
@@ -507,19 +534,8 @@ async def should_play_music(session, provider, user_text):
         {"role": "user", "content": user_text},
     ]
     try:
-        if provider == "gemini":
-            raw = await ask_gemini(session, messages)
-        elif provider in ("groq", "cerebras"):
-            raw = await ask_openai_compatible(session, provider, messages)
-        else:
-            return False, ""
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        data = json.loads(raw)
+        raw = await ask_provider(session, provider, messages)
+        data = extract_json(raw)
         return bool(data.get("is_music_request")), str(data.get("track_query", "")).strip()
     except Exception as e:
         print(f"[should_play_music] ERROR: {e}", flush=True)
@@ -539,19 +555,8 @@ async def should_create_website(session, provider, user_text):
         {"role": "user", "content": user_text},
     ]
     try:
-        if provider == "gemini":
-            raw = await ask_gemini(session, messages)
-        elif provider in ("groq", "cerebras", "openai"):
-            raw = await ask_openai_compatible(session, provider, messages)
-        else:
-            return False, ""
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        data = json.loads(raw)
+        raw = await ask_provider(session, provider, messages)
+        data = extract_json(raw)
         return bool(data.get("is_website_request")), str(data.get("site_description", "")).strip()
     except Exception as e:
         print(f"[should_create_website] ERROR: {e}", flush=True)
@@ -571,12 +576,7 @@ async def generate_website_html(session, provider, description):
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": description},
     ]
-    if provider == "gemini":
-        raw = await ask_gemini(session, messages)
-    elif provider in ("groq", "cerebras", "openai"):
-        raw = await ask_openai_compatible(session, provider, messages)
-    else:
-        raise RuntimeError(f"Unknown provider: {provider}")
+    raw = await ask_provider(session, provider, messages)
 
     raw = raw.strip()
     if raw.startswith("```"):
@@ -606,19 +606,8 @@ async def check_site_description(session, provider, description):
         {"role": "user", "content": description},
     ]
     try:
-        if provider == "gemini":
-            raw = await ask_gemini(session, messages)
-        elif provider in ("groq", "cerebras", "openai"):
-            raw = await ask_openai_compatible(session, provider, messages)
-        else:
-            raise RuntimeError(f"check_site_description: unsupported provider {provider}")
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        data = json.loads(raw)
+        raw = await ask_provider(session, provider, messages)
+        data = extract_json(raw)
         return {
             "sufficient": bool(data.get("sufficient", True)),
             "question": str(data.get("question", "")).strip(),
@@ -638,7 +627,11 @@ async def classify_request(session, provider, user_text):
         'is_music_request=true только если явно просят включить/найти/скачать музыку или песню. '
         'is_website_request=true только если явно просят создать сайт, лендинг, страницу регистрации/логина, портфолио. '
         'needs_web_search=true только если нужна свежая/актуальная информация (новости, курсы, погода, текущие события), '
-        'которую ты не можешь знать заранее. Если сообщение не подходит ни под одну категорию — все флаги false.'
+        'которую ты не можешь знать заранее. Вопросы про текущее время, дату, день недели, '
+        'сколько дней до даты, время в другом городе — НЕ требуют веб-поиска (бот считает их сам). '
+        'Если нужен поиск свежих данных — добавь в search_query текущий год. '
+        'Если сообщение не подходит ни под одну категорию — все флаги false.'
+        + _today_note()
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -653,19 +646,8 @@ async def classify_request(session, provider, user_text):
         "search_query": "",
     }
     try:
-        if provider == "gemini":
-            raw = await ask_gemini(session, messages)
-        elif provider in ("groq", "cerebras", "openai"):
-            raw = await ask_openai_compatible(session, provider, messages)
-        else:
-            raise RuntimeError(f"classify_request: unsupported provider {provider}")
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        data = json.loads(raw)
+        raw = await ask_provider(session, provider, messages)
+        data = extract_json(raw)
         return {
             "is_music_request": bool(data.get("is_music_request")),
             "track_query": str(data.get("track_query", "")).strip(),
@@ -696,19 +678,8 @@ async def classify_is_addressed(session, provider, user_text):
         {"role": "user", "content": user_text},
     ]
     try:
-        if provider == "gemini":
-            raw = await ask_gemini(session, messages)
-        elif provider in ("groq", "cerebras", "openai"):
-            raw = await ask_openai_compatible(session, provider, messages)
-        else:
-            raise RuntimeError(f"classify_is_addressed: unsupported provider {provider}")
-        raw = raw.strip()
-        if raw.startswith("```"):
-            raw = raw.strip("`")
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        data = json.loads(raw)
+        raw = await ask_provider(session, provider, messages)
+        data = extract_json(raw)
         return bool(data.get("addressed_to_bot"))
     except Exception as e:
         print(f"[classify_is_addressed] {provider} ERROR: {e}", flush=True)
@@ -758,12 +729,7 @@ async def summarize_conversation(session, provider, previous_summary, new_messag
     ]
 
     try:
-        if provider == "gemini":
-            raw = await ask_gemini(session, messages)
-        elif provider in ("groq", "cerebras", "openai"):
-            raw = await ask_openai_compatible(session, provider, messages)
-        else:
-            raise RuntimeError(f"summarize_conversation: unsupported provider {provider}")
+        raw = await ask_provider(session, provider, messages)
 
         raw = raw.strip()
         if raw.startswith("```"):

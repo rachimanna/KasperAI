@@ -12,6 +12,7 @@ Silero работает локально и бесплатно.
 """
 
 import os
+import html
 import io
 import wave
 import asyncio
@@ -555,10 +556,16 @@ async def handle_voice_message(
         recognized_text,
     )
 
-    await message.answer(
-        f"🎙 *Распознал:* {recognized_text}",
-        parse_mode="Markdown",
-    )
+    # БАГ: распознанный текст шёл в Markdown как есть — если в нём был
+    # символ _ * [ ` (например «user_name» или «2*2»), Telegram отвечал
+    # ошибкой парсинга и весь голосовой ответ падал. Теперь HTML + escape.
+    try:
+        await message.answer(
+            f"🎙 <b>Распознал:</b> {html.escape(recognized_text)}",
+            parse_mode="HTML",
+        )
+    except Exception as exc:
+        log.warning("[voice] recognized echo failed: %s", exc)
 
     # -----------------------------------------------------
     # 3. HISTORY
@@ -616,6 +623,22 @@ async def handle_voice_message(
         "без звёздочек, без списков с тире. "
         "Пиши как будто говоришь вслух."
     )
+
+    # Время: голосовой Каспер тоже знает, который час, и считает даты.
+    try:
+        from database.db import get_user_timezone
+        from router.time_awareness import build_time_context, time_facts
+
+        user_tz = await get_user_timezone(message.from_user.id)
+        system_prompt += "\n\n" + build_time_context(user_tz)
+        facts = time_facts(recognized_text, user_tz)
+        if facts:
+            system_prompt += (
+                "\n\nТОЧНЫЕ РАСЧЁТЫ ПО ВОПРОСУ (используй их как истину):\n- "
+                + "\n- ".join(facts)
+            )
+    except Exception as exc:
+        log.warning("[voice] time context error: %s", exc)
 
     messages = [
         {

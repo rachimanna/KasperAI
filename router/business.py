@@ -127,9 +127,16 @@ async def handle_business_message(bot, raw_message: dict) -> None:
         return
 
     try:
+        from router.time_awareness import build_time_context, time_facts
+
+        system = BUSINESS_SYSTEM_PROMPT + "\n\n" + build_time_context(None)
+        facts = time_facts(question)
+        if facts:
+            system += "\n\nТОЧНЫЕ РАСЧЁТЫ ПО ВОПРОСУ:\n- " + "\n- ".join(facts)
+
         result = await ask(
             [
-                {"role": "system", "content": BUSINESS_SYSTEM_PROMPT},
+                {"role": "system", "content": system},
                 {"role": "user", "content": question},
             ]
         )

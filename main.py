@@ -12,6 +12,7 @@ from aiogram import executor
 from database.db import init_db, close_db
 from router.ai_router import init_http_session, close_http_session
 from router.game_logic import phase_checker_loop
+from router.reminders import reminder_loop
 from router.business_raw_diag import patch_check_result_for_business_diag
 from telegram.handlers import register_handlers
 from config.settings import ADMIN_IDS
@@ -84,6 +85,9 @@ async def on_startup(dp):
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
         BotCommand("gamestats", "Моя статистика «Теневого города»"),
+        BotCommand("reminders", "Мои напоминания"),
+        BotCommand("tz", "Мой часовой пояс"),
+        BotCommand("help", "Что я умею"),
     ])
 
     # Админские команды показываем в подсказках только самим админам —
@@ -97,6 +101,9 @@ async def on_startup(dp):
         BotCommand("shadowcity", "Начать игру «Теневой город»"),
         BotCommand("stopshadowcity", "Остановить текущую игру"),
         BotCommand("gamestats", "Моя статистика «Теневого города»"),
+        BotCommand("reminders", "Мои напоминания"),
+        BotCommand("tz", "Мой часовой пояс"),
+        BotCommand("help", "Что я умею"),
         BotCommand("stats", "Статистика бота (админ)"),
         BotCommand("ban", "Забанить пользователя (ответом/@username/id)"),
         BotCommand("unban", "Разбанить пользователя (ответом/@username/id)"),
@@ -116,6 +123,10 @@ async def on_startup(dp):
     # продвигает их. Живёт в games.phase_ends_at, поэтому переживает
     # пересыпание/передеплой Render.
     asyncio.create_task(phase_checker_loop(dp.bot))
+
+    # Напоминания («напомни через 20 минут …») — хранятся в БД,
+    # фоновая задача раз в 15 секунд отправляет наступившие.
+    asyncio.create_task(reminder_loop(dp.bot))
 
     # Логирование памяти каждую минуту — см. _current_memory_mb выше:
     # единственный способ следить за потреблением на free-тарифе Render,

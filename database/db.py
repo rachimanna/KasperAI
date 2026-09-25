@@ -1,8 +1,11 @@
 import aiosqlite
 import os
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import asyncio
+
+from config.settings import ADMIN_IDS
+from router.time_awareness import now_in, utc_now_str
 
 # DATABASE_PATH — новый основной параметр. DB_PATH поддержан для старых
 # деплоев, чтобы существующая БД на Render не потерялась при обновлении.
@@ -64,7 +67,7 @@ async def init_db():
             chat_id INTEGER,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
@@ -89,8 +92,7 @@ async def init_db():
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS usage_limits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            user_id INTEGER PRIMARY KEY,
             request_count INTEGER DEFAULT 0,
             last_date TEXT,
             FOREIGN KEY(user_id) REFERENCES users(id)
@@ -250,7 +252,69 @@ async def init_db():
     await _ensure_column(db, "player_stats", "role_doctor_count", "INTEGER DEFAULT 0")
     await _ensure_column(db, "player_stats", "role_civilian_count", "INTEGER DEFAULT 0")
 
+    # Время сообщений: в старой (боевой) БД колонка называется created_at,
+    # а в свежей схеме раньше была timestamp — из-за этого /stats падал.
+    # Теперь везде created_at; save_message пишет её явно (UTC).
+    await _ensure_column(db, "messages", "created_at", "TEXT")
+
+    # Часовой пояс пользователя (IANA-имя), NULL -> BOT_TIMEZONE.
+    await _ensure_column(db, "users", "timezone", "TEXT")
+
+    await _fix_usage_limits_schema(db)
+
+    # Напоминания («напомни через 20 минут …»). due_at — UTC.
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            telegram_chat_id INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            due_at TEXT NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            sent INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(sent, due_at)"
+    )
+
     await db.commit()
+
+
+async def _fix_usage_limits_schema(db):
+    """
+    БАГ: в свежей схеме usage_limits был id AUTOINCREMENT, а user_id НЕ
+    уникальный. check_and_increment_limit делает ON CONFLICT(user_id), и
+    SQLite на такой таблице кидает ошибку -> на новой БД бот падал на
+    каждом сообщении. Если таблица уже создана с этой схемой — пересобираем
+    её с user_id PRIMARY KEY (берём максимальный счётчик на пользователя).
+    """
+    cursor = await db.execute("PRAGMA table_info(usage_limits)")
+    cols = {row[1]: row[5] for row in await cursor.fetchall()}  # name -> pk
+    if cols.get("user_id"):
+        return
+    await db.execute("ALTER TABLE usage_limits RENAME TO usage_limits_old")
+    await db.execute(
+        """
+        CREATE TABLE usage_limits (
+            user_id INTEGER PRIMARY KEY,
+            request_count INTEGER DEFAULT 0,
+            last_date TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    await db.execute(
+        """
+        INSERT OR REPLACE INTO usage_limits(user_id, request_count, last_date)
+        SELECT user_id, MAX(request_count), MAX(last_date)
+        FROM usage_limits_old GROUP BY user_id
+        """
+    )
+    await db.execute("DROP TABLE usage_limits_old")
 
 
 async def _ensure_column(db, table, column, definition):
@@ -295,8 +359,8 @@ async def save_message(user_id, role, content, chat_id=None):
     """
     db = await get_db()
     await db.execute(
-        "INSERT INTO messages (user_id, chat_id, role, content) VALUES (?, ?, ?, ?)",
-        (user_id, chat_id, role, content),
+        "INSERT INTO messages (user_id, chat_id, role, content, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, chat_id, role, content, utc_now_str()),
     )
     await db.commit()
 
@@ -316,7 +380,8 @@ async def get_history(user_id, limit=20, chat_id=None):
                        WHEN m.role = 'user' AND u.username IS NOT NULL AND u.username != ''
                        THEN '[' || u.username || ']: ' || m.content
                        ELSE m.content
-                   END AS content
+                   END AS content,
+                   m.created_at AS created_at
             FROM messages m
             JOIN users u ON u.id = m.user_id
             WHERE m.chat_id = ?
@@ -327,22 +392,54 @@ async def get_history(user_id, limit=20, chat_id=None):
     else:
         # Личка: фильтруем только сообщения без chat_id
         cursor = await db.execute(
-            "SELECT role, content FROM messages WHERE user_id = ? AND (chat_id IS NULL) ORDER BY id DESC LIMIT ?",
+            "SELECT role, content, created_at FROM messages WHERE user_id = ? AND (chat_id IS NULL) ORDER BY id DESC LIMIT ?",
             (user_id, limit),
         )
 
     rows = await cursor.fetchall()
     rows.reverse()
 
-    # Поддержка старого формата (tuple) и нового (dict)
+    # ВНИМАНИЕ: возвращается список СЛОВАРЕЙ {"role", "content", "created_at"}.
+    # Раньше telegram/handlers.py распаковывал их как кортежи
+    # (`for role, content in history`) — а распаковка dict даёт КЛЮЧИ, и в
+    # модель улетали сообщения role="role", content="content". Из-за этого
+    # бот фактически не видел последние сообщения диалога.
     result = []
     for row in rows:
         if isinstance(row, dict) or hasattr(row, "keys"):
-            result.append({"role": row["role"], "content": row["content"]})
+            keys = row.keys()
+            result.append({
+                "role": row["role"],
+                "content": row["content"],
+                "created_at": row["created_at"] if "created_at" in keys else None,
+            })
         else:
-            result.append({"role": row[0], "content": row[1]})
+            result.append({
+                "role": row[0],
+                "content": row[1],
+                "created_at": row[2] if len(row) > 2 else None,
+            })
 
     return result
+
+
+async def get_last_user_message_time(user_id, chat_id=None):
+    """Время (строка UTC) последнего сообщения ЭТОГО пользователя в диалоге."""
+    db = await get_db()
+    if chat_id is not None:
+        cursor = await db.execute(
+            "SELECT created_at FROM messages WHERE chat_id = ? AND user_id = ? AND role = 'user' "
+            "ORDER BY id DESC LIMIT 1",
+            (chat_id, user_id),
+        )
+    else:
+        cursor = await db.execute(
+            "SELECT created_at FROM messages WHERE user_id = ? AND chat_id IS NULL AND role = 'user' "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        )
+    row = await cursor.fetchone()
+    return row[0] if row else None
 
 
 async def get_last_message_id(user_id, chat_id=None):
@@ -409,10 +506,25 @@ async def get_conversation_summary(user_id, chat_id=None):
     return (row[0], row[1]) if row else (None, None)
 
 
+def _limit_day():
+    """
+    «Сегодня» для дневных лимитов. Раньше check_and_increment_limit считал
+    день по UTC, а get_usage_count (/limit) — по локальному времени сервера,
+    и около полуночи /limit показывал не то. Теперь везде один источник —
+    часовой пояс бота (BOT_TIMEZONE, по умолчанию Москва): лимит
+    сбрасывается в полночь по этому поясу.
+    """
+    return now_in().strftime("%Y-%m-%d")
+
+
 async def check_and_increment_limit(user_id, daily_limit=20, telegram_id=None):
-    """Атомарно проверяет и увеличивает дневной лимит."""
+    """Атомарно проверяет и увеличивает дневной лимит. Админы — без лимита."""
+    # БАГ: параметр telegram_id раньше вообще не использовался, и админы
+    # упирались в лимит, хотя /limit писал им «безлимит».
+    if telegram_id is not None and telegram_id in ADMIN_IDS:
+        return True, daily_limit
     db = await get_db()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = _limit_day()
     async with _db_lock:
         await db.execute(
             """
@@ -453,7 +565,7 @@ async def get_usage_count(user_id):
     Возвращает количество запросов за сегодня.
     """
     db = await get_db()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _limit_day()
 
     cursor = await db.execute(
         "SELECT request_count, last_date FROM usage_limits WHERE user_id = ?",
@@ -473,7 +585,7 @@ async def get_usage_count(user_id):
 async def check_and_increment_agent_limit(user_id, daily_limit=15):
     """Атомарный дневной лимит агента, сохраняемый в SQLite."""
     db = await get_db()
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = _limit_day()
     async with _db_lock:
         await db.execute(
             """
@@ -1077,7 +1189,7 @@ async def get_limit_status(user_id, daily_limit=20):
 async def get_messages_after(user_id, last_message_id, chat_id=None):
     """
     Возвращает сообщения пользователя с id > last_message_id (или все,
-    если last_message_id is None) как список (id, role, content), по
+    если last_message_id is None) как список (id, role, content, created_at), по
     возрастанию id. chat_id=None -> личка (только сообщения без chat_id),
     иначе — сообщения конкретного группового чата.
     """
@@ -1087,7 +1199,7 @@ async def get_messages_after(user_id, last_message_id, chat_id=None):
     if chat_id is not None:
         cursor = await db.execute(
             """
-            SELECT id, role, content FROM messages
+            SELECT id, role, content, created_at FROM messages
             WHERE chat_id = ? AND id > ?
             ORDER BY id ASC
             """,
@@ -1096,7 +1208,7 @@ async def get_messages_after(user_id, last_message_id, chat_id=None):
     else:
         cursor = await db.execute(
             """
-            SELECT id, role, content FROM messages
+            SELECT id, role, content, created_at FROM messages
             WHERE user_id = ? AND chat_id IS NULL AND id > ?
             ORDER BY id ASC
             """,
@@ -1143,7 +1255,7 @@ async def get_provider_stats(hours=24):
     список {"provider":, "total":, "failed":}, отсортированный по total.
     """
     db = await get_db()
-    since = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     cursor = await db.execute(
         """
         SELECT provider,
@@ -1185,9 +1297,9 @@ async def get_active_users_count(hours=24):
     последние `hours` часов.
     """
     db = await get_db()
-    since = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     cursor = await db.execute(
-        "SELECT COUNT(DISTINCT user_id) FROM messages WHERE timestamp >= ?",
+        "SELECT COUNT(DISTINCT user_id) FROM messages WHERE created_at >= ?",
         (since,),
     )
     row = await cursor.fetchone()
@@ -1202,9 +1314,9 @@ async def get_total_messages_count(hours=None):
     db = await get_db()
 
     if hours is not None:
-        since = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+        since = (datetime.now(timezone.utc) - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
         cursor = await db.execute(
-            "SELECT COUNT(*) FROM messages WHERE timestamp >= ?",
+            "SELECT COUNT(*) FROM messages WHERE created_at >= ?",
             (since,),
         )
     else:
@@ -1293,6 +1405,90 @@ async def delete_project(user_id, name):
     cursor = await db.execute(
         "DELETE FROM projects WHERE user_id = ? AND name = ?",
         (user_id, name),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+# ==================== ЧАСОВОЙ ПОЯС ====================
+
+async def get_user_timezone(telegram_id):
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT timezone FROM users WHERE telegram_id = ?", (telegram_id,)
+    )
+    row = await cursor.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def set_user_timezone(telegram_id, tz_name):
+    db = await get_db()
+    await db.execute(
+        "UPDATE users SET timezone = ? WHERE telegram_id = ?", (tz_name, telegram_id)
+    )
+    await db.commit()
+
+
+# ==================== НАПОМИНАНИЯ ====================
+
+async def add_reminder(user_id, telegram_chat_id, text, due_at_utc):
+    """due_at_utc — aware datetime в UTC. Возвращает id напоминания."""
+    db = await get_db()
+    cursor = await db.execute(
+        "INSERT INTO reminders (user_id, telegram_chat_id, text, due_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (
+            user_id,
+            telegram_chat_id,
+            text,
+            due_at_utc.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+            utc_now_str(),
+        ),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def get_due_reminders(limit=50):
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, user_id, telegram_chat_id, text, due_at FROM reminders "
+        "WHERE sent = 0 AND due_at <= ? ORDER BY due_at ASC LIMIT ?",
+        (utc_now_str(), limit),
+    )
+    return await cursor.fetchall()
+
+
+async def mark_reminder_sent(reminder_id):
+    db = await get_db()
+    await db.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+    await db.commit()
+
+
+async def get_user_reminders(user_id):
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT id, text, due_at, telegram_chat_id FROM reminders "
+        "WHERE user_id = ? AND sent = 0 ORDER BY due_at ASC",
+        (user_id,),
+    )
+    return await cursor.fetchall()
+
+
+async def count_user_reminders(user_id):
+    db = await get_db()
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM reminders WHERE user_id = ? AND sent = 0", (user_id,)
+    )
+    row = await cursor.fetchone()
+    return row[0] if row else 0
+
+
+async def cancel_reminder(user_id, reminder_id):
+    db = await get_db()
+    cursor = await db.execute(
+        "DELETE FROM reminders WHERE id = ? AND user_id = ? AND sent = 0",
+        (reminder_id, user_id),
     )
     await db.commit()
     return cursor.rowcount > 0

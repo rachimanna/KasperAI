@@ -3,6 +3,7 @@ import random
 import re
 import resource
 import time
+from datetime import timedelta
 
 from aiogram import Dispatcher, types
 
@@ -31,8 +32,31 @@ from database.db import (
     get_total_users_count,
     get_active_users_count,
     get_total_messages_count,
+    get_last_user_message_time,
+    get_user_timezone,
+    set_user_timezone,
 )
 from config.settings import ADMIN_IDS
+from router.time_awareness import (
+    build_time_context,
+    time_facts,
+    is_pure_time_question,
+    message_time_tag,
+    parse_db_ts,
+    utc_now_str,
+    resolve_timezone,
+    describe_zone,
+    now_in,
+    humanize_delta,
+    format_dt_ru,
+    find_cities,
+)
+from router.reminders import (
+    detect_reminder,
+    create_reminder_from_text,
+    reminders_list_text,
+    delete_reminder_cmd,
+)
 from router.business import inspect_update_for_business_fields
 from aiogram.dispatcher.middlewares import BaseMiddleware
 from aiogram.dispatcher.handler import CancelHandler
@@ -106,6 +130,90 @@ def needs_fast_web_search(text: str) -> bool:
 
 def needs_smart_classification(text: str) -> bool:
     return bool(FAST_CLASSIFY_PATTERN.search(text))
+
+
+# Сколько последних сообщений диалога отдаём модели (плюс скользящее саммари).
+HISTORY_LIMIT = 10
+
+# Telegram режет сообщения длиннее 4096 символов.
+TELEGRAM_CHUNK = 3900
+
+_TZ_PHRASE = re.compile(
+    r"(?:мой\s+часовой\s+пояс|часовой\s+пояс\s*[:\-—]|я\s+живу\s+в|я\s+сейчас\s+в|"
+    r"я\s+нахожусь\s+в|поставь\s+(?:мне\s+)?(?:часовой\s+)?пояс)\s*(?P<arg>[^\n,.!?]{2,40})",
+    re.IGNORECASE,
+)
+
+
+def _split_for_telegram(text, limit=TELEGRAM_CHUNK):
+    """
+    Делит длинный ответ на части по абзацам/строкам. Раньше ответ длиннее
+    4000 символов не отправлялся текстом, а в историю вместо него
+    записывалась заглушка «ответ слишком длинный» — и бот «забывал», что
+    ответил.
+    """
+    text = text.strip()
+    if len(text) <= limit:
+        return [text]
+    parts, current = [], ""
+    for block in re.split(r"(\n\n)", text):
+        if len(current) + len(block) <= limit:
+            current += block
+            continue
+        if current.strip():
+            parts.append(current.strip())
+        current = ""
+        while len(block) > limit:
+            cut = block.rfind("\n", 0, limit)
+            if cut < limit // 2:
+                cut = block.rfind(" ", 0, limit)
+            if cut < limit // 2:
+                cut = limit
+            parts.append(block[:cut].strip())
+            block = block[cut:]
+        current = block
+    if current.strip():
+        parts.append(current.strip())
+    # незакрытый ``` в части ломает Markdown — закрываем/открываем заново
+    fixed, carry = [], False
+    for part in parts:
+        if carry:
+            part = "```\n" + part
+        if part.count("```") % 2 == 1:
+            part += "\n```"
+            carry = True
+        else:
+            carry = False
+        fixed.append(part)
+    return fixed
+
+
+async def _send_answer(message, answer, is_group):
+    """Отправляет ответ (частями, если длинный), Markdown с откатом на обычный текст."""
+    for i, chunk in enumerate(_split_for_telegram(answer)):
+        send = message.reply if (is_group and i == 0) else message.answer
+        try:
+            await send(chunk, parse_mode="Markdown")
+        except Exception:
+            await send(chunk)
+
+
+async def _maybe_set_timezone_from_text(message, text):
+    """«мой часовой пояс Берлин», «я живу в Новосибирске» -> сохраняем пояс."""
+    m = _TZ_PHRASE.search(text)
+    if not m:
+        return False
+    arg = m.group("arg").strip()
+    tz_name = resolve_timezone(arg)
+    if not tz_name:
+        return False
+    await set_user_timezone(message.from_user.id, tz_name)
+    local = now_in(tz_name)
+    await message.reply(
+        f"🕰 Запомнил твой часовой пояс: {describe_zone(tz_name)}. "
+        f"У тебя сейчас {local:%H:%M}. Напоминания и «сегодня/завтра» теперь считаю по нему."
+    )
+    return True
 
 
 PENDING_SITE_REQUESTS = {}
@@ -417,9 +525,13 @@ async def _maybe_update_conversation_summary(user_id, chat_id):
 
         lines = []
 
-        for _msg_id, role, content in new_messages:
+        for row in new_messages:
+            role, content = row[1], row[2]
+            created_at = row[3] if len(row) > 3 else None
             label = role_labels.get(role, role)
-            lines.append(f"{label}: {content}")
+            dt = parse_db_ts(created_at)
+            stamp = f"[{dt:%d.%m.%Y %H:%M} UTC] " if dt else ""
+            lines.append(f"{stamp}{label}: {content}")
 
         new_messages_text = "\n".join(lines)
         newest_message_id = new_messages[-1][0]
@@ -522,7 +634,14 @@ async def cmd_help(message: types.Message):
         "/agent — AI-агент: найти/сравнить/сделать сайт\n"
         "/shadowcity — начать игру «Теневой город»\n"
         "/stopshadowcity — остановить текущую игру\n"
-        "/gamestats — моя статистика «Теневого города»"
+        "/gamestats — моя статистика «Теневого города»\n"
+        "/tz — мой часовой пояс (например: /tz Берлин, /tz +3)\n"
+        "/reminders — мои напоминания\n"
+        "/delreminder номер — удалить напоминание\n\n"
+        "⏰ Напоминания ставятся обычной фразой: «напомни через 20 минут "
+        "выключить духовку», «напомни завтра в 9:00 позвонить маме».\n"
+        "🕰 Про время можно спрашивать как угодно: «который час в Токио», "
+        "«сколько дней до 12 марта», «какой день недели был 12.04.1961»."
     )
 
 
@@ -541,6 +660,12 @@ async def cmd_limit(message: types.Message):
         daily_limit=20,
     )
 
+    now_local = now_in()
+    next_midnight = (now_local + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    reset_in = humanize_delta((next_midnight - now_local).total_seconds())
+
     text = (
         "📊 Использовано сегодня: "
         + str(used)
@@ -548,6 +673,10 @@ async def cmd_limit(message: types.Message):
         + chr(10)
         + "Осталось: "
         + str(remaining)
+        + chr(10)
+        + "🔄 Сброс через "
+        + reset_in
+        + f" (в 00:00 по {describe_zone(None)})"
     )
 
     await message.answer(text)
@@ -578,6 +707,65 @@ async def cmd_status(message: types.Message):
         f"💾 Память: {memory_mb:.1f} МБ (лимит 512 МБ на free-тарифе Render)\n"
         f"👥 Пользователей всего: {users_count}",
         parse_mode="HTML",
+    )
+
+
+async def cmd_tz(message: types.Message):
+    await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
+
+    arg = message.get_args() if hasattr(message, "get_args") else ""
+    arg = (arg or "").strip()
+
+    if not arg:
+        current = await get_user_timezone(message.from_user.id)
+        local = now_in(current)
+        await message.answer(
+            f"🕰 Твой часовой пояс: {describe_zone(current)}"
+            + ("" if current else " (по умолчанию)")
+            + f"\nУ тебя сейчас: {format_dt_ru(local)}\n\n"
+            "Сменить: /tz Берлин, /tz Europe/Berlin, /tz +3 или /tz мск+4"
+        )
+        return
+
+    tz_name = resolve_timezone(arg)
+
+    if not tz_name:
+        await message.answer(
+            "Не понял такой пояс 🤷 Попробуй город (/tz Новосибирск), "
+            "IANA-имя (/tz Asia/Tokyo) или смещение (/tz +5, /tz UTC-3)."
+        )
+        return
+
+    await set_user_timezone(message.from_user.id, tz_name)
+    local = now_in(tz_name)
+
+    await message.answer(
+        f"✅ Часовой пояс: {describe_zone(tz_name)}. У тебя сейчас {local:%H:%M}."
+    )
+
+
+async def cmd_reminders(message: types.Message):
+    user_id = await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
+    tz_name = await get_user_timezone(message.from_user.id)
+    await message.answer(
+        await reminders_list_text(user_id, tz_name),
+        parse_mode="HTML",
+    )
+
+
+async def cmd_delreminder(message: types.Message):
+    user_id = await get_or_create_user(
+        telegram_id=message.from_user.id,
+        username=message.from_user.username,
+    )
+    await message.answer(
+        await delete_reminder_cmd(user_id, message.get_args())
     )
 
 
@@ -770,6 +958,7 @@ async def handle_message(message: types.Message):
             return
 
         if not is_group and has_agent_hint(text):
+            is_agent_task = False
             async with aiohttp.ClientSession() as _detect_session:
                 for _provider_try_agent in get_provider_order():
                     try:
@@ -830,6 +1019,19 @@ async def handle_message(message: types.Message):
     )
 
     chat_id = message.chat.id if is_group else None
+
+    user_tz = await get_user_timezone(message.from_user.id)
+
+    # «мой часовой пояс Берлин» — сохраняем пояс, без запроса к ИИ.
+    if await _maybe_set_timezone_from_text(message, text):
+        return
+
+    # «напомни через 20 минут …» — ставим напоминание, без запроса к ИИ
+    # (и без траты дневного лимита).
+    reminder = detect_reminder(TRIGGER_PATTERN.sub("", text) if is_group else text, user_tz)
+    if reminder:
+        await create_reminder_from_text(message, user_id, reminder, user_tz)
+        return
 
     if user_id in PENDING_SITE_REQUESTS:
         pending_description = PENDING_SITE_REQUESTS.pop(user_id)
@@ -920,16 +1122,21 @@ async def handle_message(message: types.Message):
         )
         return
 
+    # БАГ: раньше сообщение сначала сохранялось, потом читалась история —
+    # и текущий вопрос попадал к модели ДВАЖДЫ (в истории и отдельным
+    # сообщением). Теперь история читается до сохранения.
+    last_user_raw = await get_last_user_message_time(user_id, chat_id=chat_id)
+
+    history = await get_history(
+        user_id,
+        limit=HISTORY_LIMIT,
+        chat_id=chat_id,
+    )
+
     await save_message(
         user_id,
         "user",
         text,
-        chat_id=chat_id,
-    )
-
-    history = await get_history(
-        user_id,
-        limit=5,
         chat_id=chat_id,
     )
 
@@ -975,13 +1182,25 @@ async def handle_message(message: types.Message):
         "кавычками. Если ниже передан контекст веб-поиска, обязательно используй "
         "его как источник фактов. Не выдумывай происхождение мемов, новости, "
         "курсы, цены и другие актуальные сведения. Если найденные результаты "
-        "не содержат ответа, честно скажи, что надёжной информации не найдено."
+        "не содержат ответа, честно скажи, что надёжной информации не найдено. "
+        "Помни контекст разговора: если пользователь ссылается на что-то "
+        "сказанное раньше («а второй вариант?», «как ты говорил»), опирайся "
+        "на историю и конспект. Если вопрос неоднозначный — выбери самое "
+        "вероятное толкование и ответь, а не переспрашивай по мелочам."
     )
 
     messages = [
         {
             "role": "system",
-            "content": KASPER_SYSTEM_PROMPT,
+            "content": (
+                KASPER_SYSTEM_PROMPT
+                + "\n\n"
+                + build_time_context(
+                    user_tz,
+                    parse_db_ts(last_user_raw),
+                    is_first=last_user_raw is None and not history,
+                )
+            ),
         }
     ]
 
@@ -1003,7 +1222,21 @@ async def handle_message(message: types.Message):
             }
         )
 
-    for role, content in history:
+    # БАГ: get_history возвращает СЛОВАРИ, а тут было `for role, content in
+    # history` — распаковка dict даёт ключи, и модель получала 5 сообщений
+    # вида role="role", content="content" вместо реальной переписки.
+    for item in history:
+        role = item.get("role")
+        content = item.get("content")
+
+        if role not in ("user", "assistant") or not content:
+            continue
+
+        if role == "user":
+            tag = message_time_tag(item.get("created_at"), user_tz)
+            if tag:
+                content = f"{tag} {content}"
+
         messages.append(
             {
                 "role": role,
@@ -1011,10 +1244,34 @@ async def handle_message(message: types.Message):
             }
         )
 
+    # Точные расчёты по времени/датам (часы в других городах, сколько дней
+    # до даты, день недели и т.п.) — считаем сами, модели отдаём готовое.
+    exact_time_facts = time_facts(text, user_tz)
+
+    if exact_time_facts:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "ТОЧНЫЕ РАСЧЁТЫ ПО ВОПРОСУ (посчитано программно, это "
+                    "истина — используй эти числа, не пересчитывай и не "
+                    "спорь с ними):\n- " + "\n- ".join(exact_time_facts)
+                ),
+            }
+        )
+
+    pure_time_question = is_pure_time_question(text)
+
     search_context = ""
     classification = None
 
-    if needs_fast_web_search(text):
+    if pure_time_question:
+        print(
+            "[Kasper] Time question: answered from clock, web search skipped.",
+            flush=True,
+        )
+
+    elif needs_fast_web_search(text):
         query = text
 
         print(
@@ -1234,7 +1491,13 @@ async def handle_message(message: types.Message):
                 )
                 search_context = ""
 
-    user_content = text
+    user_prefix = ""
+
+    if is_group and message.from_user.username:
+        user_prefix = f"[{message.from_user.username}]: "
+
+    now_tag = message_time_tag(utc_now_str(), user_tz)
+    user_content = f"{now_tag} {user_prefix}{text}".strip()
 
     if search_context:
         user_content = (
@@ -1295,34 +1558,12 @@ async def handle_message(message: types.Message):
         if not answer:
             answer = "⚠️ AI вернул пустой ответ."
 
-        if len(answer) > 4000:
-            import os as _os
-
-            _os.makedirs(
-                "generated_sites",
-                exist_ok=True,
-            )
-
-            _long_path = (
-                f"generated_sites/answer_"
-                f"{user_id}_{message.message_id}.txt"
-            )
-
-            with open(
-                _long_path,
-                "w",
-                encoding="utf-8-sig",
-            ) as _f:
-                _f.write(answer)
-
-            answer = (
-                "⚠️ Ответ получился слишком длинным для сообщения, "
-                "отправляю файлом."
-            )
-
-            _send_as_file = _long_path
-        else:
-            _send_as_file = None
+        # Модель иногда повторяет служебную метку времени в начале ответа.
+        answer = re.sub(
+            r"^\s*\[(?:сегодня|вчера|Пн|Вт|Ср|Чт|Пт|Сб|Вс|\d{2}\.\d{2}(?:\.\d{4})?)\s+\d{1,2}:\d{2}\]\s*",
+            "",
+            answer,
+        ) or answer
 
         await save_message(
             user_id,
@@ -1362,35 +1603,7 @@ async def handle_message(message: types.Message):
             except Exception:
                 pass
 
-            try:
-                await message.answer(
-                    answer,
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                await message.answer(answer)
-
-        elif is_group:
-            try:
-                await message.reply(
-                    answer,
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                await message.reply(answer)
-
-        else:
-            try:
-                await message.answer(
-                    answer,
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                await message.answer(answer)
-
-        if _send_as_file:
-            doc = types.InputFile(_send_as_file)
-            await message.answer_document(doc)
+        await _send_answer(message, answer, is_group)
 
     except Exception as e:
         print(
@@ -1398,7 +1611,12 @@ async def handle_message(message: types.Message):
             flush=True,
         )
 
-        error_text = f"⚠️ Ошибка AI: {e}"
+        # Раньше пользователю показывался сырой текст ошибки со всеми
+        # ответами провайдеров (JSON, HTTP-коды, куски тел ответов).
+        error_text = (
+            "⚠️ Все мои нейронки сейчас прилегли отдохнуть. "
+            "Попробуй ещё раз через минуту."
+        )
 
         if animation_task:
             animation_task.cancel()
@@ -2333,6 +2551,21 @@ def register_handlers(dp: Dispatcher):
     dp.register_message_handler(
         cmd_agent,
         commands=["agent"],
+    )
+
+    dp.register_message_handler(
+        cmd_tz,
+        commands=["tz", "timezone"],
+    )
+
+    dp.register_message_handler(
+        cmd_reminders,
+        commands=["reminders"],
+    )
+
+    dp.register_message_handler(
+        cmd_delreminder,
+        commands=["delreminder"],
     )
 
     dp.register_callback_query_handler(
