@@ -32,4 +32,13 @@ async def main():
         print(item)
 
 
-asyncio.run(main())
+async def run():
+    from database.db import close_db
+    try:
+        await main()
+    finally:
+        await close_db()
+
+
+if __name__ == "__main__":
+    asyncio.run(run())

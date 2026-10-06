@@ -286,7 +286,19 @@ async def handle_night_action(game_id, phase_number, action_type, actor_user_id,
     Просто сохраняет выбор — резолвом ночи занимается resolve_night(),
     которую дёргает фоновый таймер по истечении phase_ends_at.
     """
+    game = await get_game_by_id(game_id)
+    if not game or game[2] != "night" or game[5] != phase_number:
+        return False
+    players = await get_game_players(game_id)
+    actor = next((p for p in players if p[1] == actor_user_id and p[5]), None)
+    target = next((p for p in players if p[1] == target_user_id and p[5]), None)
+    roles = {ACTION_KILL: "shadow", ACTION_CHECK: "detective", ACTION_HEAL: "doctor"}
+    if not actor or not target or actor[4] != roles.get(action_type):
+        return False
+    if actor_user_id == target_user_id and action_type != ACTION_HEAL:
+        return False
     await save_game_action(game_id, phase_number, actor_user_id, action_type, target_user_id)
+    return True
 
 
 async def _build_voting_keyboard(game_id, players):

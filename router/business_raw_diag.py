@@ -82,7 +82,7 @@ def patch_check_result_for_business_diag(bot) -> None:
                     if found_keys:
                         print(
                             f"[business] RAW DIAG update_id={raw_update.get('update_id')} "
-                            f"keys={found_keys} raw={_json.dumps(raw_update, ensure_ascii=False)}",
+                            f"keys={found_keys}",
                             flush=True,
                         )
 

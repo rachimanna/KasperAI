@@ -17,12 +17,15 @@ from router.business_raw_diag import patch_check_result_for_business_diag
 from telegram.handlers import register_handlers
 from config.settings import ADMIN_IDS
 
+_background_tasks = []
+_ready = threading.Event()
+
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
+        self.send_response(200 if _ready.is_set() else 503)
         self.end_headers()
-        self.wfile.write(b"OK")
+        self.wfile.write(b"OK" if _ready.is_set() else b"Starting")
 
     def log_message(self, format, *args):
         pass
@@ -122,22 +125,28 @@ async def on_startup(dp):
     # проверяет БД на игры с истёкшей фазой (ночь/голосование) и
     # продвигает их. Живёт в games.phase_ends_at, поэтому переживает
     # пересыпание/передеплой Render.
-    asyncio.create_task(phase_checker_loop(dp.bot))
+    _background_tasks.append(asyncio.create_task(phase_checker_loop(dp.bot)))
 
     # Напоминания («напомни через 20 минут …») — хранятся в БД,
     # фоновая задача раз в 15 секунд отправляет наступившие.
-    asyncio.create_task(reminder_loop(dp.bot))
+    _background_tasks.append(asyncio.create_task(reminder_loop(dp.bot)))
 
     # Логирование памяти каждую минуту — см. _current_memory_mb выше:
     # единственный способ следить за потреблением на free-тарифе Render,
     # где графики памяти скрыты за платным планом.
-    asyncio.create_task(memory_logger_loop())
+    _background_tasks.append(asyncio.create_task(memory_logger_loop()))
 
     print("Database: OK")
     print("Kasper AI is running.")
+    _ready.set()
 
 
 async def on_shutdown(dp):
+    _ready.clear()
+    for task in _background_tasks:
+        task.cancel()
+    await asyncio.gather(*_background_tasks, return_exceptions=True)
+    _background_tasks.clear()
     try:
         print(f"[memory] RSS at shutdown = {_current_memory_mb():.1f} MB", flush=True)
     except Exception as e:
@@ -148,7 +157,7 @@ async def on_shutdown(dp):
 
 def main():
 
-    load_dotenv(override=True)
+    load_dotenv()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -191,6 +200,7 @@ def main():
         on_startup=on_startup,
         on_shutdown=on_shutdown,
         loop=loop,
+        allowed_updates=["message", "callback_query", "business_connection", "business_message"],
     )
 
 

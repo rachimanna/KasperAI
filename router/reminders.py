@@ -13,6 +13,7 @@ import asyncio
 import html
 import random
 import re
+from aiogram.utils.exceptions import BotBlocked, ChatNotFound, UserDeactivated
 from datetime import datetime, timezone
 
 from database.db import (
@@ -158,9 +159,12 @@ async def reminder_loop(bot):
                     body += f"\n(с опозданием на {humanize_delta(late)} — я отключался, извиняй)"
                 try:
                     await bot.send_message(chat_id, body)
+                except (BotBlocked, ChatNotFound, UserDeactivated):
+                    await mark_reminder_sent(rid)
+                    continue
                 except Exception as e:
                     print(f"[reminders] send #{rid} error: {e}", flush=True)
-                # помечаем в любом случае, чтобы не спамить при заблокированном боте
+                    continue
                 await mark_reminder_sent(rid)
         except Exception as e:
             print(f"[reminders] loop error: {e}", flush=True)

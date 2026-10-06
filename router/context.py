@@ -14,8 +14,8 @@ async def get_context(user_id, limit=20):
 
     return [
         {
-            "role": role,
-            "content": content,
+            "role": item["role"],
+            "content": item["content"],
         }
-        for role, content in history
+        for item in history
     ]

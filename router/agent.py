@@ -25,6 +25,7 @@ import aiohttp
 
 from router.ai_router import (
     extract_json,
+    json_flag,
     ask_provider,
     get_provider_order,
     generate_website_html,
@@ -119,7 +120,7 @@ async def is_actual_task(session, provider, user_text: str) -> bool:
         ]
         raw = await ask_provider(session, provider, messages)
         data = extract_json(raw)
-        return bool(data.get("is_task", True))
+        return json_flag(data.get("is_task", True))
     except Exception as e:
         print(f"[agent] is_actual_task {provider} ERROR: {e}", flush=True)
         # При сбое классификатора не блокируем пользователя — считаем задачей,

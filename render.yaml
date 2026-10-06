@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: kasper-ai
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.14
+      - key: GEMINI_MODEL
+        value: gemini-3.8-flash
+      - key: GEMINI_THINKING_LEVEL
+        value: medium
+      - key: AI_PROVIDERS
+        value: gemini,groq,cerebras
+      - key: ENABLE_LOCAL_TTS
+        value: "false"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false

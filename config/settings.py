@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "")
@@ -14,7 +14,7 @@ CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "")
 
 AI_PROVIDERS = [
     p.strip().lower()
-    for p in os.getenv("AI_PROVIDERS", "groq,cerebras,gemini").split(",")
+    for p in os.getenv("AI_PROVIDERS", "gemini,groq,cerebras").split(",")
     if p.strip()
 ]
 

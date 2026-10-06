@@ -126,9 +126,15 @@ async def _run_ytdlp(cmd, timeout=120):
         print("[music] yt-dlp TIMEOUT", flush=True)
         try:
             process.kill()
+            await process.wait()
         except Exception:
             pass
         return False
+    except asyncio.CancelledError:
+        if 'process' in locals() and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise
     except FileNotFoundError:
         print("[music] yt-dlp не установлен в окружении", flush=True)
         return False

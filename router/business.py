@@ -31,6 +31,8 @@ sendMessage (это не отдельный метод!) — значит дос
 не хватает для этого параметра.
 """
 
+from router.quality import QUALITY_PROMPT
+
 import re
 
 from router.ai_router import ask
@@ -63,7 +65,7 @@ BUSINESS_SYSTEM_PROMPT = (
 # регистронезависимо, с необязательными знаками препинания/пробелами
 # сразу после триггера (","/":"/" "/"!" и т.п.), напр. "Каспер, сколько 8+8".
 _TRIGGER_PATTERN = re.compile(
-    r"^\s*каспер[\s,:!\-]*", re.IGNORECASE,
+    r"^\s*(?:каспер|kasper)\b[\s,:!\-]*", re.IGNORECASE,
 )
 
 
@@ -101,6 +103,8 @@ async def handle_business_message(bot, raw_message: dict) -> None:
     - текст не начинается с триггера.
     """
     business_connection_id = raw_message.get("business_connection_id")
+    if (raw_message.get("from") or {}).get("is_bot"):
+        return
     if not business_connection_id:
         return
 
@@ -129,7 +133,7 @@ async def handle_business_message(bot, raw_message: dict) -> None:
     try:
         from router.time_awareness import build_time_context, time_facts
 
-        system = BUSINESS_SYSTEM_PROMPT + "\n\n" + build_time_context(None)
+        system = BUSINESS_SYSTEM_PROMPT + "\n\n" + QUALITY_PROMPT + "\n\n" + build_time_context(None)
         facts = time_facts(question)
         if facts:
             system += "\n\nТОЧНЫЕ РАСЧЁТЫ ПО ВОПРОСУ:\n- " + "\n- ".join(facts)
@@ -157,16 +161,15 @@ async def _send_business_message(bot, business_connection_id: str, chat_id, text
     момент выхода библиотеки (появился в Bot API 7.2).
     """
     from aiogram.bot import api as aiogram_api
+    from telegram.handlers import _split_for_telegram
 
     try:
-        await bot.request(
-            aiogram_api.Methods.SEND_MESSAGE,
-            {
-                "chat_id": chat_id,
-                "text": text,
-                "business_connection_id": business_connection_id,
-            },
-        )
+        for chunk in _split_for_telegram(text):
+            await bot.request(
+                aiogram_api.Methods.SEND_MESSAGE,
+                {"chat_id": chat_id, "text": chunk,
+                 "business_connection_id": business_connection_id},
+            )
     except Exception as e:
         print(f"[business] send_message error: {e}", flush=True)
 

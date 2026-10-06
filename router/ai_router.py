@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import re
@@ -5,14 +6,14 @@ import re
 import aiohttp
 from dotenv import load_dotenv
 
-load_dotenv(override=True)
+load_dotenv()
 
 
 TIMEOUT = aiohttp.ClientTimeout(
-    total=45,
+    total=120,
     connect=10,
     sock_connect=10,
-    sock_read=35,
+    sock_read=110,
 )
 
 
@@ -44,18 +45,26 @@ async def close_http_session():
 
 
 async def _post(session, url, headers, payload):
-    async with session.post(
-        url,
-        headers=headers,
-        json=payload,
-    ) as response:
-        body = await response.text()
-        return response.status, body
+    # Retry transient failures only, with a bounded delay and attempt count.
+    for attempt in range(3):
+        try:
+            async with session.post(url, headers=headers, json=payload, timeout=TIMEOUT) as response:
+                body = await response.text()
+                status = response.status
+                retry_after = response.headers.get("Retry-After", "")
+            if status not in (429, 500, 502, 503, 504) or attempt == 2:
+                return status, body
+            delay = min(float(retry_after), 10) if retry_after.isdigit() else 2 ** attempt
+            await asyncio.sleep(delay)
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2 ** attempt)
 
 
 async def ask_gemini(session, messages):
     key = os.getenv("GEMINI_API_KEY")
-    model = os.getenv("GEMINI_MODEL")
+    model = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 
     if not key:
         raise RuntimeError("Gemini API key is missing")
@@ -101,6 +110,8 @@ async def ask_gemini(session, messages):
 
     if not contents:
         raise RuntimeError("Gemini received empty messages")
+    if contents[-1]["role"] != "user":
+        raise ValueError("Gemini requires a final user message")
 
     url = (
         "https://generativelanguage.googleapis.com/"
@@ -110,6 +121,12 @@ async def ask_gemini(session, messages):
     payload = {
         "contents": contents,
     }
+
+    if model.startswith("gemini-3"):
+        level = os.getenv("GEMINI_THINKING_LEVEL", "medium").lower()
+        if level not in ("low", "medium", "high"):
+            raise ValueError("GEMINI_THINKING_LEVEL must be low, medium or high")
+        payload["generationConfig"] = {"thinkingConfig": {"thinkingLevel": level}}
 
     if system_parts:
         payload["systemInstruction"] = {
@@ -144,7 +161,7 @@ async def ask_gemini(session, messages):
         text_parts = []
 
         for part in parts:
-            if isinstance(part, dict) and "text" in part:
+            if isinstance(part, dict) and "text" in part and not part.get("thought"):
                 text_parts.append(part["text"])
 
         answer = "".join(text_parts).strip()
@@ -348,6 +365,16 @@ def _today_note():
         return ""
 
 
+def _json_object(value):
+    if not isinstance(value, dict):
+        raise ValueError("Expected a JSON object from the classifier")
+    return value
+
+
+def json_flag(value):
+    return value is True or (isinstance(value, str) and value.strip().lower() == "true")
+
+
 def extract_json(raw):
     """
     Достаёт JSON-объект из ответа модели. Модели часто оборачивают JSON в
@@ -359,27 +386,26 @@ def extract_json(raw):
     if fence:
         text = fence.group(1).strip()
     try:
-        return json.loads(text)
+        return _json_object(json.loads(text))
     except json.JSONDecodeError:
         pass
     start = text.find("{")
     end = text.rfind("}")
     if start != -1 and end > start:
-        return json.loads(text[start:end + 1])
+        return _json_object(json.loads(text[start:end + 1]))
     raise json.JSONDecodeError("no JSON object in model answer", text, 0)
 
 
 def get_provider_order():
     value = os.getenv(
         "AI_PROVIDERS",
-        "groq,cerebras,gemini",
+        "gemini,groq,cerebras",
     )
 
-    return [
-        provider.strip().lower()
-        for provider in value.split(",")
-        if provider.strip()
-    ]
+    order = list(dict.fromkeys(p.strip().lower() for p in value.split(",") if p.strip()))
+    key_names = {"gemini": ("GEMINI_API_KEY",), "groq": ("GROQ_API_KEY", "GROQ_API_KEY_2"),
+                 "cerebras": ("CEREBRAS_API_KEY",), "openai": ("OPENAI_API_KEY",), "xkiro": ("XKIRO_API_KEY",)}
+    return [p for p in order if p not in key_names or any(os.getenv(k) for k in key_names[p])]
 
 
 async def ask_provider(session, provider, messages):
@@ -515,7 +541,7 @@ async def should_search_web(session, provider, user_text):
 
         data = extract_json(raw)
 
-        return bool(data.get("need_search")), str(data.get("query", "")).strip()
+        return json_flag(data.get("need_search")), str(data.get("query", "")).strip()
 
     except Exception as e:
         print(f"[should_search_web] ERROR: {e}", flush=True)
@@ -536,7 +562,7 @@ async def should_play_music(session, provider, user_text):
     try:
         raw = await ask_provider(session, provider, messages)
         data = extract_json(raw)
-        return bool(data.get("is_music_request")), str(data.get("track_query", "")).strip()
+        return json_flag(data.get("is_music_request")), str(data.get("track_query", "")).strip()
     except Exception as e:
         print(f"[should_play_music] ERROR: {e}", flush=True)
         return False, ""
@@ -557,7 +583,7 @@ async def should_create_website(session, provider, user_text):
     try:
         raw = await ask_provider(session, provider, messages)
         data = extract_json(raw)
-        return bool(data.get("is_website_request")), str(data.get("site_description", "")).strip()
+        return json_flag(data.get("is_website_request")), str(data.get("site_description", "")).strip()
     except Exception as e:
         print(f"[should_create_website] ERROR: {e}", flush=True)
         return False, ""
@@ -609,7 +635,7 @@ async def check_site_description(session, provider, description):
         raw = await ask_provider(session, provider, messages)
         data = extract_json(raw)
         return {
-            "sufficient": bool(data.get("sufficient", True)),
+            "sufficient": json_flag(data.get("sufficient", True)),
             "question": str(data.get("question", "")).strip(),
         }
     except Exception as e:
@@ -649,11 +675,11 @@ async def classify_request(session, provider, user_text):
         raw = await ask_provider(session, provider, messages)
         data = extract_json(raw)
         return {
-            "is_music_request": bool(data.get("is_music_request")),
+            "is_music_request": json_flag(data.get("is_music_request")),
             "track_query": str(data.get("track_query", "")).strip(),
-            "is_website_request": bool(data.get("is_website_request")),
+            "is_website_request": json_flag(data.get("is_website_request")),
             "site_description": str(data.get("site_description", "")).strip(),
-            "needs_web_search": bool(data.get("needs_web_search")),
+            "needs_web_search": json_flag(data.get("needs_web_search")),
             "search_query": str(data.get("search_query", "")).strip(),
         }
     except Exception as e:
@@ -680,7 +706,7 @@ async def classify_is_addressed(session, provider, user_text):
     try:
         raw = await ask_provider(session, provider, messages)
         data = extract_json(raw)
-        return bool(data.get("addressed_to_bot"))
+        return json_flag(data.get("addressed_to_bot"))
     except Exception as e:
         print(f"[classify_is_addressed] {provider} ERROR: {e}", flush=True)
         raise

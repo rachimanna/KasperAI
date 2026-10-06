@@ -13,6 +13,7 @@ DB_PATH = os.getenv("DATABASE_PATH") or os.getenv("DB_PATH") or "data/kasper.db"
 
 _db_conn = None
 _db_lock = asyncio.Lock()
+_connection_lock = asyncio.Lock()
 
 
 async def get_db():
@@ -20,13 +21,20 @@ async def get_db():
     Возвращает единственное соединение с БД (singleton).
     """
     global _db_conn
-    if _db_conn is None:
-        Path(DB_PATH).expanduser().parent.mkdir(parents=True, exist_ok=True)
-        _db_conn = await aiosqlite.connect(DB_PATH)
-        _db_conn.row_factory = aiosqlite.Row
-        await _db_conn.execute("PRAGMA foreign_keys = ON")
-        await _db_conn.execute("PRAGMA busy_timeout = 5000")
-        await _db_conn.execute("PRAGMA journal_mode = WAL")
+    async with _connection_lock:
+        if _db_conn is None:
+            path = str(Path(DB_PATH).expanduser())
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            conn = await aiosqlite.connect(path)
+            try:
+                conn.row_factory = aiosqlite.Row
+                await conn.execute("PRAGMA foreign_keys = ON")
+                await conn.execute("PRAGMA busy_timeout = 5000")
+                await conn.execute("PRAGMA journal_mode = WAL")
+            except BaseException:
+                await conn.close()
+                raise
+            _db_conn = conn
     return _db_conn
 
 

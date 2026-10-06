@@ -1,0 +1,5 @@
+# Optional local Silero TTS for servers with sufficient memory.
+-r requirements.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.5.0
+omegaconf==2.3.0

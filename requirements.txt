@@ -1,28 +1,9 @@
-aiogram==2.15
-aiohappyeyeballs==2.7.1
-aiohttp==3.14.3
-aiosignal==1.4.0
+# aiogram 2 API is used throughout the project; use Python 3.11.
+aiogram==2.25.2
+aiohttp==3.8.6
 aiosqlite==0.22.1
-anyio==4.14.2
-attrs==26.1.0
-babel==2.18.0
-certifi==2026.7.22
-frozenlist==1.8.0
-h11==0.16.0
-httpcore==1.0.9
-httpx==0.28.1
-idna==3.19
-multidict==6.7.1
-packaging==26.3
-propcache==0.5.2
 python-dotenv==1.2.3
-setuptools==84.0.0
-wheel==0.48.0
-yarl==1.24.5
 yt-dlp==2026.8.19
 tzdata>=2024.1
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.5.0
 numpy==2.1.3
-omegaconf==2.3.0
 imageio-ffmpeg==0.6.0

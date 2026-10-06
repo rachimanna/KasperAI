@@ -1,37 +1,21 @@
-import os
-import subprocess
-import json
-from dotenv import load_dotenv
+"""Manual live AI test. Requires keys; not part of the offline test suite."""
+import asyncio
+import aiohttp
+from router.ai_router import ask_gemini, ask, close_http_session
+from database.db import close_db
 
-load_dotenv()
+async def main(provider="gemini"):
+    try:
+        if provider == "gemini":
+            async with aiohttp.ClientSession() as session:
+                answer = await ask_gemini(session, [{"role": "user", "content": "Ответь одним словом: ПРИВЕТ"}])
+            print("Gemini: OK", answer)
+        else:
+            result = await ask("Ответь одним словом: ПРИВЕТ")
+            print("Router: OK", result["provider"], result["answer"])
+    finally:
+        await close_http_session()
+        await close_db()
 
-key = os.getenv("GEMINI_API_KEY")
-model = os.getenv("GEMINI_MODEL")
-
-url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-
-payload = json.dumps({
-    "contents": [
-        {
-            "parts": [
-                {"text": "Ответь одним словом: ПРИВЕТ"}
-            ]
-        }
-    ]
-})
-
-result = subprocess.run(
-    [
-        "curl",
-        "-sS",
-        url,
-        "-H", "Content-Type: application/json",
-        "-X", "POST",
-        "-d", payload,
-    ],
-    capture_output=True,
-    text=True,
-    timeout=30,
-)
-
-print(result.stdout[:2000])
+if __name__ == "__main__":
+    asyncio.run(main())

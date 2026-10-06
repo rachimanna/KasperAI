@@ -11,6 +11,8 @@
 Silero работает локально и бесплатно.
 """
 
+from router.quality import QUALITY_PROMPT
+
 import os
 import html
 import io
@@ -36,7 +38,7 @@ SAMPLE_RATE = 24000
 
 DOWNLOAD_TIMEOUT = 30
 STT_TIMEOUT = 30
-AI_TIMEOUT = 60
+AI_TIMEOUT = 120
 TTS_TIMEOUT = 60
 FFMPEG_TIMEOUT = 30
 
@@ -140,11 +142,7 @@ def _warmup_model():
         )
 
 
-threading.Thread(
-    target=_warmup_model,
-    name="silero-warmup",
-    daemon=True,
-).start()
+# Silero loads only on the first voice response, never during bot startup.
 
 
 # =========================================================
@@ -232,11 +230,6 @@ async def transcribe_voice(
     data.add_field(
         "model",
         WHISPER_MODEL,
-    )
-
-    data.add_field(
-        "language",
-        "ru",
     )
 
     data.add_field(
@@ -394,6 +387,9 @@ async def synthesize_speech(
     speaker: str = SPEAKER,
 ) -> bytes:
     """Асинхронный TTS."""
+
+    if os.getenv("ENABLE_LOCAL_TTS", "false").lower() not in ("true", "1", "yes"):
+        raise RuntimeError("Local TTS is disabled; sending the text response instead")
 
     text = (
         text or ""
@@ -624,6 +620,8 @@ async def handle_voice_message(
         "Пиши как будто говоришь вслух."
     )
 
+    system_prompt += "\n\n" + QUALITY_PROMPT
+
     # Время: голосовой Каспер тоже знает, который час, и считает даты.
     try:
         from database.db import get_user_timezone
@@ -792,6 +790,11 @@ async def handle_voice_message(
     # 5. TTS
     # -----------------------------------------------------
 
+    if os.getenv("ENABLE_LOCAL_TTS", "false").lower() not in ("true", "1", "yes"):
+        from telegram.handlers import _send_answer
+        await _send_answer(message, ai_response, message.chat.type != "private")
+        return
+
     log.info(
         "[voice] step 5/6: TTS"
     )
@@ -813,9 +816,8 @@ async def handle_voice_message(
 
         # AI ответ уже есть —
         # отдаём его текстом.
-        await message.answer(
-            ai_response
-        )
+        from telegram.handlers import _send_answer
+        await _send_answer(message, ai_response, message.chat.type != "private")
 
         return
 
@@ -851,6 +853,5 @@ async def handle_voice_message(
             exc,
         )
 
-        await message.answer(
-            ai_response
-        )
+        from telegram.handlers import _send_answer
+        await _send_answer(message, ai_response, message.chat.type != "private")
