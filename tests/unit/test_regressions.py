@@ -30,7 +30,7 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
                 {"role": "user", "content": "B"}])
         self.assertEqual(answer, "Ответ")
         _, url, headers, payload = post.call_args.args
-        self.assertIn("gemini-3.8-flash", url)
+        self.assertIn("gemini-3.5-flash", url)
         self.assertEqual(headers["x-goog-api-key"], "test")
         self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], "rules")
         self.assertEqual(payload["contents"][0]["parts"][0]["text"], "A\n\nB")

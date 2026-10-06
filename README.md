@@ -1,4 +1,4 @@
-# Kasper AI — Gemini 3.8 Flash
+# Kasper AI — Gemini 3.5 Flash
 
 Telegram-бот: чат с контекстом, поиск Tavily, сайты, агент, голосовые,
 напоминания и «Теневой город». Python 3.11, aiogram 2.25.2.
@@ -16,7 +16,7 @@ Telegram-бот: чат с контекстом, поиск Tavily, сайты, 
 | `PYTHON_VERSION` | `3.11.14` |
 | `TELEGRAM_BOT_TOKEN` | Токен вашего бота из BotFather |
 | `GEMINI_API_KEY` | Ваш ключ Google AI Studio с доступом к модели |
-| `GEMINI_MODEL` | `gemini-3.8-flash` |
+| `GEMINI_MODEL` | `gemini-3.5-flash` |
 | `GEMINI_FALLBACK_MODELS` | `gemini-3.7-flash` — запасная модель при перегрузке основной |
 | `GEMINI_THINKING_LEVEL` | `medium` (или `high` для более сложных задач) |
 | `AI_PROVIDERS` | `gemini,groq,cerebras` |
