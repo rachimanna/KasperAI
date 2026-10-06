@@ -17,6 +17,7 @@ Telegram-бот: чат с контекстом, поиск Tavily, сайты, 
 | `TELEGRAM_BOT_TOKEN` | Токен вашего бота из BotFather |
 | `GEMINI_API_KEY` | Ваш ключ Google AI Studio с доступом к модели |
 | `GEMINI_MODEL` | `gemini-3.8-flash` |
+| `GEMINI_FALLBACK_MODELS` | `gemini-3.7-flash` — запасная модель при перегрузке основной |
 | `GEMINI_THINKING_LEVEL` | `medium` (или `high` для более сложных задач) |
 | `AI_PROVIDERS` | `gemini,groq,cerebras` |
 | `ENABLE_LOCAL_TTS` | `false` |
@@ -81,3 +82,5 @@ python -m compileall -q config database memory projects router telegram main.py
 ночные ходы, потеря напоминаний при сетевой ошибке, утечка дочернего
 процесса загрузчика при отмене, загрузка TTS при старте, строковые false
 в классификаторах и повторная отправка сообщений при ошибках сети.
+
+При HTTP 429/5xx после повторных попыток бот пробует запасную Gemini с тем же ключом. Каждый новый запрос снова начинается с основной модели. Пустое `GEMINI_FALLBACK_MODELS` отключает переключение. Доступ к запасной модели также зависит от ключа и квоты Google. Логи `model=... OK` показывают, какая Gemini фактически ответила.

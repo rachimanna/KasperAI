@@ -36,6 +36,28 @@ class ProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["contents"][0]["parts"][0]["text"], "A\n\nB")
         self.assertEqual(payload["generationConfig"]["thinkingConfig"]["thinkingLevel"], "medium")
 
+    async def test_gemini_model_fallback_on_503(self):
+        body = json.dumps({"candidates": [{"content": {"parts": [{"text": "backup answer"}]}}]})
+        post = AsyncMock(side_effect=[(503, "busy"), (200, body)])
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "GEMINI_MODEL": "gemini-3.8-flash", "GEMINI_FALLBACK_MODELS": "gemini-3.7-flash"}), patch.object(ai, "_post", post):
+            self.assertEqual(await ai.ask_gemini(None, [{"role": "user", "content": "hi"}]), "backup answer")
+        self.assertIn("gemini-3.8-flash", post.call_args_list[0].args[1])
+        self.assertIn("gemini-3.7-flash", post.call_args_list[1].args[1])
+
+    async def test_gemini_auth_does_not_switch_models(self):
+        post = AsyncMock(return_value=(403, "no access"))
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test"}), patch.object(ai, "_post", post):
+            with self.assertRaises(ai.GeminiHTTPError):
+                await ai.ask_gemini(None, [{"role": "user", "content": "hi"}])
+        post.assert_awaited_once()
+
+    async def test_gemini_fallback_can_be_disabled(self):
+        post = AsyncMock(return_value=(503, "busy"))
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "GEMINI_FALLBACK_MODELS": ""}), patch.object(ai, "_post", post):
+            with self.assertRaises(RuntimeError):
+                await ai.ask_gemini(None, [{"role": "user", "content": "hi"}])
+        post.assert_awaited_once()
+
     async def test_invalid_thinking_rejected(self):
         with patch.dict(os.environ, {"GEMINI_API_KEY": "test", "GEMINI_MODEL": "gemini-3.8-flash", "GEMINI_THINKING_LEVEL": "minimal"}):
             with self.assertRaises(ValueError):

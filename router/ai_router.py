@@ -62,9 +62,35 @@ async def _post(session, url, headers, payload):
             await asyncio.sleep(2 ** attempt)
 
 
+class GeminiHTTPError(RuntimeError):
+    def __init__(self, status, model, body):
+        self.status = status
+        super().__init__(f"Gemini {model} HTTP {status}: {body[:500]}")
+
+
 async def ask_gemini(session, messages):
+    primary = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
+    fallback = os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.7-flash")
+    models = list(dict.fromkeys([primary] + [m.strip() for m in fallback.split(",") if m.strip()]))
+    errors = []
+    for model in models:
+        try:
+            answer = await _ask_gemini_model(session, messages, model)
+            print(f"[gemini] model={model} OK", flush=True)
+            return answer
+        except GeminiHTTPError as exc:
+            # Auth/invalid request/safety failures are not solved by changing models.
+            if exc.status not in (429, 500, 502, 503, 504):
+                raise
+            errors.append(str(exc))
+            print(f"[gemini] model={model} unavailable (HTTP {exc.status}); trying fallback", flush=True)
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as exc:
+            errors.append(f"{model}: {type(exc).__name__}")
+    raise RuntimeError("Gemini models unavailable: " + " | ".join(errors))
+
+
+async def _ask_gemini_model(session, messages, model):
     key = os.getenv("GEMINI_API_KEY")
-    model = os.getenv("GEMINI_MODEL") or "gemini-3.8-flash"
 
     if not key:
         raise RuntimeError("Gemini API key is missing")
@@ -144,9 +170,7 @@ async def ask_gemini(session, messages):
     )
 
     if status >= 400:
-        raise RuntimeError(
-            f"Gemini HTTP {status}: {body[:500]}"
-        )
+        raise GeminiHTTPError(status, model, body)
 
     try:
         data = json.loads(body)
