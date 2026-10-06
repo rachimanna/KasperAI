@@ -10,7 +10,7 @@ services:
       - key: PYTHON_VERSION
         value: 3.11.14
       - key: GEMINI_MODEL
-        value: gemini-3.5-flash
+        value: gemini-2.5-flash
       - key: GEMINI_THINKING_LEVEL
         value: medium
       - key: AI_PROVIDERS

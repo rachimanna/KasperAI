@@ -69,7 +69,7 @@ class GeminiHTTPError(RuntimeError):
 
 
 async def ask_gemini(session, messages):
-    primary = os.getenv("GEMINI_MODEL") or "gemini-3.5-flash"
+    primary = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
     fallback = os.getenv("GEMINI_FALLBACK_MODELS", "gemini-3.7-flash")
     models = list(dict.fromkeys([primary] + [m.strip() for m in fallback.split(",") if m.strip()]))
     errors = []
