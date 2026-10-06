@@ -10,6 +10,9 @@ from aiogram import Dispatcher, types
 from database.db import (
     get_or_create_user,
     save_message,
+    refund_limit,
+    _limit_day,
+    get_game_creator,
     get_history,
     check_and_increment_limit,
     get_limit_status,
@@ -38,7 +41,7 @@ from database.db import (
 )
 from config.settings import ADMIN_IDS
 from router.quality import QUALITY_PROMPT
-from router.locks import serialized_message, serialized_summary
+from router.locks import serialized_message, serialized_summary, serialized_lobby, conversation_lock
 from aiogram.utils.exceptions import BadRequest
 from router.time_awareness import (
     build_time_context,
@@ -306,7 +309,22 @@ async def cmd_agent(message: types.Message):
     await _start_agent_flow(message, user_id, task_text)
 
 
-async def _run_agent_plan(bot, chat_id: int, user_id: int):
+async def _run_agent_plan(bot, chat_id, user_id):
+    session = AGENT_SESSIONS.get(user_id)
+    try:
+        await _run_agent_plan_body(bot, chat_id, user_id)
+    except Exception as exc:
+        print(f"[agent] task ERROR: {exc}", flush=True)
+        try:
+            await bot.send_message(chat_id, "⚠️ Агент не смог завершить задачу. Попробуй ещё раз.")
+        except Exception:
+            pass
+    finally:
+        if AGENT_SESSIONS.get(user_id) is session:
+            AGENT_SESSIONS.pop(user_id, None)
+
+
+async def _run_agent_plan_body(bot, chat_id: int, user_id: int):
     session_data = AGENT_SESSIONS.get(user_id)
     if not session_data:
         return
@@ -328,7 +346,7 @@ async def _run_agent_plan(bot, chat_id: int, user_id: int):
     async def _run_all_steps():
         async with aiohttp.ClientSession() as agent_session:
             for index, step in enumerate(plan["steps"]):
-                if AGENT_SESSIONS.get(user_id, {}).get("status") != "running":
+                if (AGENT_SESSIONS.get(user_id) is not session_data or session_data.get("status") != "running"):
                     return
 
                 try:
@@ -378,8 +396,7 @@ async def _run_agent_plan(bot, chat_id: int, user_id: int):
             "Вот что успело собраться:",
         )
 
-    if AGENT_SESSIONS.get(user_id, {}).get("status") != "running":
-        AGENT_SESSIONS.pop(user_id, None)
+    if (AGENT_SESSIONS.get(user_id) is not session_data or session_data.get("status") != "running"):
         return
 
     for description, html_code in site_files:
@@ -402,7 +419,8 @@ async def _run_agent_plan(bot, chat_id: int, user_id: int):
     final_answers = [r["output"] for r in collected if r["type"] == "answer"]
 
     if final_answers:
-        await bot.send_message(chat_id, final_answers[-1])
+        for chunk in _split_for_telegram(final_answers[-1]):
+            await bot.send_message(chat_id, chunk, parse_mode=None)
     elif not site_files:
         await bot.send_message(
             chat_id,
@@ -410,7 +428,6 @@ async def _run_agent_plan(bot, chat_id: int, user_id: int):
             "сформировано (проверь шаги выше).",
         )
 
-    AGENT_SESSIONS.pop(user_id, None)
 
 
 async def handle_agent_confirm(callback_query: types.CallbackQuery):
@@ -1143,12 +1160,8 @@ async def handle_message(message: types.Message):
         chat_id=chat_id,
     )
 
-    await save_message(
-        user_id,
-        "user",
-        text,
-        chat_id=chat_id,
-    )
+    limit_date = _limit_day()
+    ai_succeeded = False
 
     KASPER_SYSTEM_PROMPT = (
         "Ты — Kasper AI, ИИ-помощник в Telegram с дерзким, злым-но-своим "
@@ -1581,7 +1594,7 @@ async def handle_message(message: types.Message):
         answer = str(answer).strip()
 
         if not answer:
-            answer = "⚠️ AI вернул пустой ответ."
+            raise RuntimeError("AI returned an empty answer")
 
         # Модель иногда повторяет служебную метку времени в начале ответа.
         answer = re.sub(
@@ -1590,6 +1603,8 @@ async def handle_message(message: types.Message):
             answer,
         ) or answer
 
+        ai_succeeded = True
+        await save_message(user_id, "user", text, chat_id=chat_id)
         await save_message(
             user_id,
             "assistant",
@@ -1635,6 +1650,9 @@ async def handle_message(message: types.Message):
             f"[Kasper] AI ERROR: {e}",
             flush=True,
         )
+
+        if not ai_succeeded:
+            await refund_limit(user_id, limit_date, telegram_id=message.from_user.id)
 
         # Раньше пользователю показывался сырой текст ошибки со всеми
         # ответами провайдеров (JSON, HTTP-коды, куски тел ответов).
@@ -1733,6 +1751,7 @@ def _build_lobby_text(players, max_players=10):
     return "\n".join(lines)
 
 
+@serialized_lobby
 async def cmd_game(message: types.Message):
     if message.chat.type not in ("group", "supergroup"):
         await message.answer(
@@ -1750,7 +1769,7 @@ async def cmd_game(message: types.Message):
         )
         return
 
-    game_id = await create_game(chat_id)
+    game_id = await create_game(chat_id, message.from_user.id)
 
     keyboard = _build_lobby_keyboard(
         None,
@@ -1771,6 +1790,17 @@ async def cmd_game(message: types.Message):
     )
 
 
+async def _can_stop_game(bot, chat_id, game_id, telegram_id):
+    if telegram_id in ADMIN_IDS or telegram_id == await get_game_creator(game_id):
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, telegram_id)
+        return member.status in ("creator", "administrator")
+    except Exception:
+        return False
+
+
+@serialized_lobby
 async def cmd_stopgame(message: types.Message):
     if message.chat.type not in ("group", "supergroup"):
         return
@@ -1784,13 +1814,18 @@ async def cmd_stopgame(message: types.Message):
         )
         return
 
+    if not await _can_stop_game(message.bot, chat_id, existing_game[0], message.from_user.id):
+        await message.answer("Остановить игру может её создатель или администратор группы.")
+        return
+
     game_id = existing_game[0]
     game_status = existing_game[2]
 
-    await set_game_status(
-        game_id,
-        "finished",
-    )
+    async with conversation_lock(("game", game_id)):
+        await set_game_status(
+            game_id,
+            "finished",
+        )
 
     if game_status == "lobby":
         await message.answer(
@@ -1806,6 +1841,7 @@ async def cmd_stopgame(message: types.Message):
         )
 
 
+@serialized_lobby
 async def handle_game_join(callback_query: types.CallbackQuery):
     chat_id = callback_query.message.chat.id
     game = await get_active_game(chat_id)
@@ -1916,6 +1952,7 @@ async def handle_game_join(callback_query: types.CallbackQuery):
     )
 
 
+@serialized_lobby
 async def handle_game_start(callback_query: types.CallbackQuery):
     chat_id = callback_query.message.chat.id
     game = await get_active_game(chat_id)
@@ -1987,11 +2024,7 @@ async def handle_game_night_action(callback_query: types.CallbackQuery):
         await callback_query.answer("Ход недоступен или ночь уже закончилась.", show_alert=True)
         return
 
-    verb = (
-        "устранить"
-        if action_type == "kill"
-        else "проверить"
-    )
+    verb = {"kill": "устранить", "check": "проверить", "heal": "спасти"}.get(action_type, "выбрать")
 
     await callback_query.answer(
         f"Выбор сохранён ✅ ({verb})"
@@ -2147,6 +2180,7 @@ async def handle_game_vote_action(callback_query: types.CallbackQuery):
         )
 
 
+@serialized_lobby
 async def handle_game_stop(callback_query: types.CallbackQuery):
     chat_id = callback_query.message.chat.id
     game = await get_active_game(chat_id)
@@ -2158,13 +2192,18 @@ async def handle_game_stop(callback_query: types.CallbackQuery):
         )
         return
 
+    if not await _can_stop_game(callback_query.bot, chat_id, game[0], callback_query.from_user.id):
+        await callback_query.answer("Остановить игру может её создатель или администратор группы.")
+        return
+
     game_id = game[0]
     game_status = game[2]
 
-    await set_game_status(
-        game_id,
-        "finished",
-    )
+    async with conversation_lock(("game", game_id)):
+        await set_game_status(
+            game_id,
+            "finished",
+        )
 
     try:
         if game_status == "lobby":

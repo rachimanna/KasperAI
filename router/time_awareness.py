@@ -920,12 +920,20 @@ def parse_reminder(text, tz_name=None, now=None):
     due = None
     delta = parse_delta(low)
     dates = parse_dates(low, today)
-    clock = parse_clock(low)
+    clock_text = low
+    if delta and re.search(r"\b(через|спустя)\b", low):
+        start, end = delta[2]
+        clock_text = low[:start] + " " * (end - start) + low[end:]
+    clock = parse_clock(clock_text)
 
     if delta and re.search(r"\b(через|спустя)\b", low):
         td, months, span = delta
         due = (add_months(now, months) if months else now) + td
         spans.append(span)
+        if clock:
+            (h, mnt), cspan = clock
+            due = due.replace(hour=h, minute=mnt, second=0, microsecond=0)
+            spans.append(cspan)
         m = re.search(r"\b(через|спустя)\b", low)
         spans.append(m.span())
     elif dates or clock:

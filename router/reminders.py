@@ -13,7 +13,7 @@ import asyncio
 import html
 import random
 import re
-from aiogram.utils.exceptions import BotBlocked, ChatNotFound, UserDeactivated
+from aiogram.utils.exceptions import BotBlocked, BotKicked, ChatNotFound, UserDeactivated, Unauthorized, BadRequest
 from datetime import datetime, timezone
 
 from database.db import (
@@ -63,7 +63,7 @@ _FIRE_TEMPLATES = [
 def detect_reminder(text, tz_name, now=None):
     """
     Возвращает dict из parse_reminder, если это реальная просьба напомнить
-    с понятным временем в будущем. Иначе None — сообщение уйдёт в обычный
+    с понятным временем. Прошедшее время возвращается с error. Иначе None — сообщение уйдёт в обычный
     чат с ИИ (например «напомни, как решать квадратные уравнения»).
     """
     parsed = parse_reminder(text, tz_name, now=now)
@@ -74,7 +74,7 @@ def detect_reminder(text, tz_name, now=None):
         return None
     now_utc = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     if parsed["due_utc"] <= now_utc:
-        return None
+        parsed["error"] = "Это время уже прошло. Напоминание не создано — укажи будущую дату и время."
     return parsed
 
 
@@ -94,6 +94,9 @@ def _when_phrase(local_dt, now_local):
 
 async def create_reminder_from_text(message, user_id, parsed, tz_name):
     """Сохраняет напоминание и отвечает пользователю подтверждением."""
+    if parsed.get("error"):
+        await message.reply(parsed["error"])
+        return
     if await count_user_reminders(user_id) >= MAX_ACTIVE_REMINDERS:
         await message.reply(
             f"⛔ У тебя уже {MAX_ACTIVE_REMINDERS} активных напоминаний. "
@@ -159,7 +162,7 @@ async def reminder_loop(bot):
                     body += f"\n(с опозданием на {humanize_delta(late)} — я отключался, извиняй)"
                 try:
                     await bot.send_message(chat_id, body)
-                except (BotBlocked, ChatNotFound, UserDeactivated):
+                except (BotBlocked, BotKicked, ChatNotFound, UserDeactivated, Unauthorized, BadRequest):
                     await mark_reminder_sent(rid)
                     continue
                 except Exception as e:

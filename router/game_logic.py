@@ -32,6 +32,7 @@ free-инстанса Render. Фоновая задача phase_checker_loop() �
 
 import asyncio
 import random
+from router.locks import serialized_game, conversation_lock
 from datetime import datetime, timedelta, timezone
 
 from database.db import (
@@ -123,12 +124,18 @@ async def _await_last_words(bot, telegram_id):
     return entry["text"] if entry else None
 
 
+@serialized_game
 async def start_game(bot, game_id, chat_id):
     """
     Раздаёт роли, переводит игру в ночную фазу №1 и рассылает роли в личку.
     Вызывается из handlers.py по кнопке "Начать игру".
     """
+    game = await get_game_by_id(game_id)
+    if not game or game[2] != "lobby":
+        return False
     players = await get_game_players(game_id)
+    if len(players) < 4:
+        return False
 
     shadow, detective, doctor, civilians = _pick_roles(players)
 
@@ -141,6 +148,13 @@ async def start_game(bot, game_id, chat_id):
         role_by_user_id[c[1]] = "civilian"
 
     await assign_game_roles(game_id, role_by_user_id)
+
+    await set_game_phase(
+        game_id,
+        status="night",
+        phase_ends_at=_future_iso(NIGHT_DURATION_SECONDS),
+        phase_number=1,
+    )
 
     # Разослать роли в личку. Если кому-то не удалось отправить (заблокировал
     # бота уже после присоединения к лобби) — просто логируем, не роняем игру.
@@ -174,12 +188,7 @@ async def start_game(bot, game_id, chat_id):
         except Exception as e:
             print(f"[game] role DM ERROR user_id={user_id}: {e}", flush=True)
 
-    await set_game_phase(
-        game_id,
-        status="night",
-        phase_ends_at=_future_iso(NIGHT_DURATION_SECONDS),
-        phase_number=1,
-    )
+
 
     try:
         await bot.send_message(
@@ -352,14 +361,19 @@ async def _finalize_night_announcement(bot, chat_id, game_id, victim_row, base_a
     других игр), затем публикует итог ночи и открывает голосование.
     """
     last_words = await _await_last_words(bot, victim_row[2])
-    text = base_announce
-    if last_words:
-        name = _display_name(victim_row[3], victim_row[2])
-        text += f"\n\n💬 Последние слова {name}:\n«{last_words}»"
+    async with conversation_lock(("game", game_id)):
+        game = await get_game_by_id(game_id)
+        if not game or game[2] != "voting":
+            return
+        text = base_announce
+        if last_words:
+            name = _display_name(victim_row[3], victim_row[2])
+            text += f"\n\n💬 Последние слова {name}:\n«{last_words}»"
 
-    await _send_voting_message(bot, chat_id, game_id, players, text)
+        await _send_voting_message(bot, chat_id, game_id, players, text)
 
 
+@serialized_game
 async def resolve_night(bot, game_id):
     """
     Подводит итоги ночи: убивает жертву Тени (если Доктор её не спас),
@@ -452,12 +466,18 @@ async def _finalize_voting_announcement(bot, chat_id, game_id, excluded_row, bas
     и открывает следующую ночь.
     """
     last_words = await _await_last_words(bot, excluded_row[2])
-    lines = list(base_lines)
-    if last_words:
-        name = _display_name(excluded_row[3], excluded_row[2])
-        lines.append(f"\n💬 Последние слова {name}:\n«{last_words}»")
+    async with conversation_lock(("game", game_id)):
+        game = await get_game_by_id(game_id)
+        if not game or game[2] != "night":
+            return
+        if game[5] != next_phase_number:
+            return
+        lines = list(base_lines)
+        if last_words:
+            name = _display_name(excluded_row[3], excluded_row[2])
+            lines.append(f"\n💬 Последние слова {name}:\n«{last_words}»")
 
-    await _announce_next_night(bot, chat_id, game_id, players, lines, next_phase_number)
+        await _announce_next_night(bot, chat_id, game_id, players, lines, next_phase_number)
 
 
 async def _announce_next_night(bot, chat_id, game_id, players, announce_lines, next_phase_number):
@@ -492,6 +512,7 @@ async def _announce_next_night(bot, chat_id, game_id, players, announce_lines, n
         await _send_night_action_keyboard(bot, game_id, next_phase_number, doctor_row, players, ACTION_HEAL, allow_self=True)
 
 
+@serialized_game
 async def resolve_voting(bot, game_id):
     """
     Подводит итоги голосования: исключает игрока с наибольшим числом

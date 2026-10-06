@@ -247,12 +247,16 @@ async def init_db():
     # со старой схемой games/game_players/users/player_stats — CREATE TABLE
     # IF NOT EXISTS их не тронет, а новой логике (router/game_logic.py,
     # telegram/handlers.py) нужны дополнительные колонки.
+    await _ensure_column(db, "games", "creator_telegram_id", "INTEGER")
     await _ensure_column(db, "games", "status", "TEXT DEFAULT 'lobby'")
     await _ensure_column(db, "games", "lobby_message_id", "INTEGER")
     await _ensure_column(db, "games", "phase_ends_at", "TEXT")
     await _ensure_column(db, "games", "phase_number", "INTEGER DEFAULT 1")
 
     await _ensure_column(db, "game_players", "telegram_id", "INTEGER")
+    # Keep the earliest membership when upgrading an old database with duplicates.
+    await db.execute("DELETE FROM game_players WHERE id NOT IN (SELECT MIN(id) FROM game_players GROUP BY game_id, user_id)")
+    await db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_game_membership ON game_players(game_id, user_id)")
 
     await _ensure_column(db, "users", "is_banned", "INTEGER DEFAULT 0")
 
@@ -633,17 +637,17 @@ async def check_and_increment_agent_limit(user_id, daily_limit=15):
 GAME_ROW_COLUMNS = "id, chat_id, status, lobby_message_id, phase_ends_at, phase_number"
 
 
-async def create_game(chat_id):
+async def create_game(chat_id, creator_telegram_id=None):
     """
     Создаёт новую игру в чате (лобби, фаза 1).
     """
     db = await get_db()
     await db.execute(
         """
-        INSERT INTO games (chat_id, status, lobby_message_id, phase_ends_at, phase_number)
-        VALUES (?, 'lobby', NULL, NULL, 1)
+        INSERT INTO games (chat_id, creator_telegram_id, status, lobby_message_id, phase_ends_at, phase_number)
+        VALUES (?, ?, 'lobby', NULL, NULL, 1)
         """,
-        (chat_id,),
+        (chat_id, creator_telegram_id),
     )
     await db.commit()
 
@@ -766,19 +770,18 @@ async def add_game_player(game_id, user_id, telegram_id, username=None):
     Добавляет игрока в игру, если его там ещё нет.
     Возвращает True, если добавлен, False — если уже был в игре.
     """
-    if await is_player_in_game(game_id, user_id):
-        return False
-
     db = await get_db()
-    await db.execute(
+    cursor = await db.execute(
         """
-        INSERT INTO game_players (game_id, user_id, telegram_id, username, role, is_alive)
-        VALUES (?, ?, ?, ?, NULL, 1)
+        INSERT OR IGNORE INTO game_players (game_id, user_id, telegram_id, username, role, is_alive)
+        SELECT ?, ?, ?, ?, NULL, 1
+        WHERE EXISTS (SELECT 1 FROM games WHERE id = ? AND status = 'lobby')
+          AND (SELECT COUNT(*) FROM game_players WHERE game_id = ?) < 10
         """,
-        (game_id, user_id, telegram_id, username),
+        (game_id, user_id, telegram_id, username, game_id, game_id),
     )
     await db.commit()
-    return True
+    return cursor.rowcount == 1
 
 
 async def is_player_in_game(game_id, user_id):
@@ -1140,8 +1143,9 @@ async def set_user_banned(telegram_id, banned):
     """
     db = await get_db()
     await db.execute(
-        "UPDATE users SET is_banned = ? WHERE telegram_id = ?",
-        (1 if banned else 0, telegram_id),
+        "INSERT INTO users(telegram_id, is_banned) VALUES (?, ?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET is_banned = excluded.is_banned",
+        (telegram_id, 1 if banned else 0),
     )
     await db.commit()
 
@@ -1500,3 +1504,19 @@ async def cancel_reminder(user_id, reminder_id):
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def refund_limit(user_id, date, telegram_id=None):
+    if telegram_id in ADMIN_IDS:
+        return
+    db = await get_db()
+    async with _db_lock:
+        await db.execute("UPDATE usage_limits SET request_count = MAX(0, request_count - 1) WHERE user_id = ? AND last_date = ?", (user_id, date))
+        await db.commit()
+
+
+async def get_game_creator(game_id):
+    db = await get_db()
+    cursor = await db.execute("SELECT creator_telegram_id FROM games WHERE id = ?", (game_id,))
+    row = await cursor.fetchone()
+    return row[0] if row else None

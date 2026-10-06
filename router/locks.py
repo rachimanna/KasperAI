@@ -36,3 +36,20 @@ def serialized_summary(func):
         async with conversation_lock(("summary", scope)):
             return await func(user_id, chat_id)
     return wrapper
+
+
+def serialized_lobby(func):
+    @wraps(func)
+    async def wrapper(event, *args, **kwargs):
+        message = getattr(event, "message", None) or event
+        async with conversation_lock(("lobby", message.chat.id)):
+            return await func(event, *args, **kwargs)
+    return wrapper
+
+
+def serialized_game(func):
+    @wraps(func)
+    async def wrapper(bot, game_id, *args, **kwargs):
+        async with conversation_lock(("game", game_id)):
+            return await func(bot, game_id, *args, **kwargs)
+    return wrapper

@@ -179,6 +179,71 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await db.cancel_reminder(self.other, rid))
         self.assertTrue(await db.cancel_reminder(self.uid, rid))
 
+    async def test_ban_before_first_message(self):
+        await db.set_user_banned(9999, True)
+        await db.get_or_create_user(9999, "new")
+        self.assertTrue(await db.is_user_banned(9999))
+        await db.set_user_banned(9999, False)
+        self.assertFalse(await db.is_user_banned(9999))
+
+    async def test_concurrent_join_unique_and_closed_lobby(self):
+        gid = await db.create_game(-1, 1001)
+        results = await asyncio.gather(*(db.add_game_player(gid, self.uid, 1001) for _ in range(20)))
+        self.assertEqual(sum(results), 1)
+        self.assertEqual(len(await db.get_game_players(gid)), 1)
+        await db.set_game_status(gid, "night")
+        self.assertFalse(await db.add_game_player(gid, self.other, 1002))
+
+    async def test_duplicate_membership_migration(self):
+        gid = await db.create_game(-1)
+        conn = await db.get_db()
+        await conn.execute("DROP INDEX idx_game_membership")
+        for _ in range(2):
+            await conn.execute("INSERT INTO game_players(game_id,user_id,telegram_id) VALUES (?,?,?)", (gid, self.uid, 1001))
+        await conn.commit()
+        await db.init_db()
+        await db.init_db()
+        self.assertEqual(len(await db.get_game_players(gid)), 1)
+        self.assertFalse(await db.add_game_player(gid, self.uid, 1001))
+
+    async def test_concurrent_start_assigns_once(self):
+        gid = await db.create_game(-1)
+        for n in range(4):
+            uid = await db.get_or_create_user(2000+n)
+            await db.add_game_player(gid, uid, 2000+n)
+        bot = SimpleNamespace(send_message=AsyncMock())
+        with patch.object(game_logic, "assign_game_roles", wraps=db.assign_game_roles) as assign, patch.object(game_logic, "_send_night_action_keyboard", AsyncMock()) as keyboard:
+            await asyncio.gather(*(game_logic.start_game(bot, gid, -1) for _ in range(3)))
+            self.assertEqual(assign.call_count, 1)
+            self.assertEqual(keyboard.await_count, 3)
+        self.assertEqual((await db.get_game_by_id(gid))[2], "night")
+
+    async def test_refund_keeps_new_day_usage(self):
+        await db.check_and_increment_limit(self.uid)
+        await db.refund_limit(self.uid, "2000-01-01")
+        self.assertEqual(await db.get_usage_count(self.uid), 1)
+        await db.refund_limit(self.uid, db._limit_day())
+        self.assertEqual(await db.get_usage_count(self.uid), 0)
+
+    async def test_ai_failure_refunds_and_does_not_save_question(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=-1, type="group"),
+            from_user=SimpleNamespace(id=1001, username="first"), text="Каспер привет",
+            reply_to_message=None, answer=AsyncMock(), reply=AsyncMock())
+        with patch.object(handlers, "ask", AsyncMock(side_effect=RuntimeError("all providers failed"))), patch.object(handlers, "needs_fast_web_search", return_value=False), patch.object(handlers, "needs_smart_classification", return_value=False):
+            await handlers.handle_message(message)
+        self.assertEqual(await db.get_usage_count(self.uid), 0)
+        self.assertEqual(await db.get_history(self.uid, chat_id=-1), [])
+        message.reply.assert_awaited_once()
+
+    async def test_ai_success_saves_pair_and_consumes_one_request(self):
+        message = SimpleNamespace(chat=SimpleNamespace(id=-1, type="group"),
+            from_user=SimpleNamespace(id=1001, username="first"), text="Каспер привет",
+            reply_to_message=None, answer=AsyncMock(), reply=AsyncMock())
+        with patch.object(handlers, "ask", AsyncMock(return_value={"answer": "Привет"})), patch.object(handlers, "needs_fast_web_search", return_value=False), patch.object(handlers, "needs_smart_classification", return_value=False), patch.object(handlers, "_maybe_update_conversation_summary", AsyncMock()):
+            await handlers.handle_message(message)
+        self.assertEqual(await db.get_usage_count(self.uid), 1)
+        self.assertEqual([m["role"] for m in await db.get_history(self.uid, chat_id=-1)], ["user", "assistant"])
+
 
 class BehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def test_lock_order_and_cleanup(self):
@@ -236,6 +301,66 @@ class BehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(voice._model_error)
         importlib.import_module("main")
 
+    async def test_past_reminder_reports_error_without_insert(self):
+        now = datetime(2026, 10, 6, 16, tzinfo=timezone.utc)
+        parsed = reminders.detect_reminder("напомни сегодня в 10 утра выпить воду", "Europe/Berlin", now)
+        self.assertIn("error", parsed)
+        message = SimpleNamespace(reply=AsyncMock())
+        with patch.object(reminders, "add_reminder", AsyncMock()) as add:
+            await reminders.create_reminder_from_text(message, 1, parsed, "Europe/Berlin")
+            add.assert_not_awaited()
+        message.reply.assert_awaited_once()
+
+    async def test_kicked_reminder_is_not_retried(self):
+        from aiogram.utils.exceptions import BotKicked
+        bot = SimpleNamespace(send_message=AsyncMock(side_effect=BotKicked("kicked")))
+        async def stop(*args): raise asyncio.CancelledError
+        row = (1, 2, -3, "test", "2026-01-01 10:00:00")
+        with patch.object(reminders, "get_due_reminders", AsyncMock(return_value=[row])), patch.object(reminders, "mark_reminder_sent", AsyncMock()) as mark, patch.object(reminders.asyncio, "sleep", side_effect=stop):
+            with self.assertRaises(asyncio.CancelledError): await reminders.reminder_loop(bot)
+            mark.assert_awaited_once_with(1)
+
+    async def test_stopped_game_does_not_announce_after_last_words(self):
+        bot = SimpleNamespace(send_message=AsyncMock())
+        row = (1, 2, 3, "name", "civilian", 0)
+        with patch.object(game_logic, "_await_last_words", AsyncMock(return_value="bye")), patch.object(game_logic, "get_game_by_id", AsyncMock(return_value=(1, -1, "finished", None, None, 2))), patch.object(game_logic, "_send_voting_message", AsyncMock()) as vote, patch.object(game_logic, "_announce_next_night", AsyncMock()) as night:
+            await game_logic._finalize_night_announcement(bot, -1, 1, row, "end", [])
+            await game_logic._finalize_voting_announcement(bot, -1, 1, row, [], [], 2)
+            vote.assert_not_awaited()
+            night.assert_not_awaited()
+
+    async def test_agent_long_answer_and_cleanup(self):
+        uid = 888
+        text = "😀" * 6000
+        handlers.AGENT_SESSIONS[uid] = {"status": "running", "task": "test", "plan": {"steps": [{"type": "answer", "description": "answer"}]}}
+        bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(edit_text=AsyncMock())))
+        with patch.object(handlers, "run_step", AsyncMock(return_value={"type": "answer", "output": text})), patch.object(handlers, "format_progress_text", return_value="progress"):
+            await handlers._run_agent_plan(bot, 1, uid)
+        chunks = [c.args[1] for c in bot.send_message.call_args_list[1:]]
+        self.assertEqual("".join(chunks), text)
+        self.assertTrue(all(len(c.encode("utf-16-le"))//2 <= 4096 for c in chunks))
+        self.assertNotIn(uid, handlers.AGENT_SESSIONS)
+
+    async def test_agent_send_failure_cleans_session(self):
+        handlers.AGENT_SESSIONS[889] = {"status": "running"}
+        with patch.object(handlers, "_run_agent_plan_body", AsyncMock(side_effect=RuntimeError("send failed"))):
+            await handlers._run_agent_plan(SimpleNamespace(send_message=AsyncMock()), 1, 889)
+        self.assertNotIn(889, handlers.AGENT_SESSIONS)
+
+    async def test_stop_permission_creator_admin_and_member(self):
+        bot = SimpleNamespace(get_chat_member=AsyncMock(return_value=SimpleNamespace(status="member")))
+        with patch.object(handlers, "get_game_creator", AsyncMock(return_value=1001)), patch.object(handlers, "ADMIN_IDS", []):
+            self.assertTrue(await handlers._can_stop_game(bot, -1, 1, 1001))
+            self.assertFalse(await handlers._can_stop_game(bot, -1, 1, 1002))
+            bot.get_chat_member.return_value.status = "administrator"
+            self.assertTrue(await handlers._can_stop_game(bot, -1, 1, 1002))
+
+    async def test_doctor_confirmation(self):
+        cb = SimpleNamespace(data="night:1:2:heal:3", from_user=SimpleNamespace(id=1001, username="a"), answer=AsyncMock(), message=SimpleNamespace(edit_reply_markup=AsyncMock()))
+        with patch.object(handlers, "get_or_create_user", AsyncMock(return_value=1)), patch.object(handlers, "handle_night_action", AsyncMock(return_value=True)):
+            await handlers.handle_game_night_action(cb)
+        self.assertIn("спасти", cb.answer.call_args.args[0])
+
 
 class TextTests(unittest.TestCase):
     def test_json_fences(self):
@@ -274,6 +399,19 @@ class TextTests(unittest.TestCase):
 
     def test_reminder_question_not_scheduled(self):
         self.assertIsNone(reminders.detect_reminder("напомни как решать уравнения?", "Europe/Berlin"))
+
+    def test_relative_days_with_exact_clock(self):
+        now = datetime(2026, 10, 6, 16, tzinfo=timezone.utc)
+        parsed = reminders.detect_reminder("напомни через 2 дня в 10 утра выпить воду", "Europe/Berlin", now)
+        self.assertEqual(parsed["local"].day, 8)
+        self.assertEqual(parsed["local"].hour, 10)
+        self.assertEqual(parsed["text"], "выпить воду")
+
+    def test_clock_without_date_rolls_to_tomorrow(self):
+        now = datetime(2026, 10, 6, 16, tzinfo=timezone.utc)
+        parsed = reminders.detect_reminder("напомни в 10 утра выпить воду", "Europe/Berlin", now)
+        self.assertEqual(parsed["local"].day, 7)
+        self.assertNotIn("error", parsed)
 
 
 if __name__ == "__main__": unittest.main()
